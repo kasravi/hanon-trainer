@@ -1,13 +1,7 @@
 import { setupDebugOverlay, writeToStorage, readFromStorage } from "./utils.js";
 import { draw } from "./render.js";
-import {
-  generateScale,
-  generateScaleFromDegree,
-  getNote,
-  getNoteName,
-  scales,
-  allNotes,
-} from "./scales.js";
+import { generateScale, getNoteIndex, getNote, getNoteName, allNotes } from "./scales.js";
+import { lessons } from "./lessons.js";
 
 const range = (end, start) => {
   if (start === undefined) {
@@ -19,104 +13,95 @@ const range = (end, start) => {
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const doMeasure = async (measure, desc, degrees, fingerings) => {
-    const key = document.getElementById("keys").value;
-    const major = document.getElementById("majmin").value === "major";
-    const [scale, scaleName] = generateScale(key, major ? "major" : "minor");
+  const key = document.getElementById("allKeys").value;
+  const major = document.getElementById("majmin").value === "major";
+  const [scale, scaleName] = generateScale(key, major ? "major" : "minor");
 
-    let degreesTr = degrees.map((f) => f);
-    const notes = (v, b) =>
-      degreesTr
-        .map(
-          (i, index) =>
-            getNote(i, scale, scaleName, b, 16) + `[id="n${v}${index + 1}"]`
-        )
-        .join(", ");
+  let degreesTr = degrees.map((f) => f);
+  const notes = (v, b) => degreesTr.map((i, index) => getNote(i+1, scale, scaleName, b, 16) + `[id="n${v}${index + 1}"]`).join(", ");
 
-    if (desc) {
-      degreesTr = degrees.map((f) => 5 - f);
+  if (desc) {
+    degreesTr = degrees.map((f) => 5 - f);
+  }
+  degreesTr = degreesTr.map((f) => f + measure - 1);
+  let highlightedNote = -1;
+  let activeNotes = new Set();
+
+  const moveNoteForward = (resolve, notes) => {
+    highlightedNote++;
+    if (highlightedNote >= degreesTr.length) {
+      highlightedNote = -1;
+      resolve();
+      return;
     }
-    degreesTr = degreesTr.map((f) => f + measure - 1);
+    draw(scaleName, [notes("t", 3), notes("b", 2)], fingerings, highlightedNote);
+    let k = document.getElementById("pianoKeys");
+    let index = getNoteIndex(getNoteName(degreesTr[highlightedNote]+1, scale, scaleName));
+    let octave = Math.floor((degreesTr[highlightedNote]+1)/7);
+    k.setAttribute("marked-keys", `${index + octave *12 + 1} ${index+ octave *12 + 13}`);
 
+    activeNotes.clear();
+  };
+  try {
     const midiAccess = await navigator.requestMIDIAccess();
-    const activeNotes = new Set();
 
     return new Promise((resolve) => {
-        // wait(500).then(resolve)
-        document.getElementById("output").addEventListener(
-          "click",
-          () => {
-            resolve();
-          },
-          { once: true }
-        );
-        const onMidiMessage = (message) => {
-          const [status, note, velocity] = message.data;
-
-          if (status === 144 && velocity > 0) {
-            // Note On
-            activeNotes.add(note);
-          } else if (status === 128 || (status === 144 && velocity === 0)) {
-            // Note Off
-            activeNotes.delete(note);
-          }
-
-          const trebleNote = getNote(
-            degrees[highlightedNote],
-            scale,
-            scaleName,
-            4,
-            16
-          );
-          const bassNote = getNote(
-            degrees[highlightedNote],
-            scale,
-            scaleName,
-            3,
-            16
-          );
-          if (activeNotes.has(trebleNote) && activeNotes.has(bassNote)) {
-            highlightedNote++;
-            if (highlightedNote >= notes.length) {
-              highlightedNote = 0;
-              resolve();
-            }
-            draw(
-              scaleName,
-              [notes("t", 3), notes("b", 2)],
-              fingerings,
-              highlightedNote
-            );
-            activeNotes.clear();
-          }
-        };
-
-        midiAccess.inputs.forEach((input) =>
-          input.addEventListener("midimessage", onMidiMessage)
-        );
-
-        const highlightedNote = 0;
-        draw(
-          scaleName,
-          [notes("t", 3), notes("b", 2)],
-          fingerings,
-          highlightedNote
-        );
+      // wait(500).then(resolve)
+      document.getElementById("output").addEventListener(
+        "click",
+        () => {
+          resolve();
+        },
+        { once: true }
+      );
+      document.addEventListener("contextmenu", (event) => {
+        event.preventDefault();
+        moveNoteForward(resolve, notes);
       });
-}
+      const onMidiMessage = (message) => {
+        const [status, note, velocity] = message.data;
+
+        if (status === 144 && velocity > 0) {
+          // Note On
+          activeNotes.add(note);
+        } else if (status === 128 || (status === 144 && velocity === 0)) {
+          // Note Off
+          activeNotes.delete(note);
+        }
+        
+        const trebleNote = getNote(degrees[highlightedNote], scale, scaleName, 4, 16);
+        const bassNote = getNote(degrees[highlightedNote], scale, scaleName, 3, 16);
+        
+        console.log("Active Notes:", activeNotes, "Treble Note:", trebleNote, "Bass Note:", bassNote, "Message" ,message.data);
+        if (activeNotes.has(trebleNote) && activeNotes.has(bassNote)) {
+          moveNoteForward();
+        }
+      };
+
+      midiAccess.inputs.forEach((input) => input.addEventListener("midimessage", onMidiMessage));
+
+      //draw(scaleName, [notes("t", 3), notes("b", 2)], fingerings, highlightedNote);
+      moveNoteForward(resolve, notes);
+    });
+  } catch (error) {
+    console.error("Error during MIDI access:", error);
+    alert("MIDI access failed. Please ensure your MIDI device is connected.");
+    return;
+  }
+};
 
 const doLesson = async (measure, degrees, fingerings) => {
-
-    const getContext = ()=>{
-        const key = document.getElementById("keys").value;
-        const major = document.getElementById("majmin").value === "major"
-        const lessonIndex = currentLessonIndex;
-        return {
-            key,
-            major,
-            lessonIndex,
-        }
-    }
-    const con= getContext();
+  const getContext = () => {
+    const key = document.getElementById("allKeys").value;
+    const major = document.getElementById("majmin").value === "major";
+    const lessonIndex = currentLessonIndex;
+    return {
+      key,
+      major,
+      lessonIndex,
+    };
+  };
+  const con = getContext();
 
   const measures = range(15)
     .map((f) => [f, false])
@@ -126,77 +111,27 @@ const doLesson = async (measure, degrees, fingerings) => {
         .reverse()
     );
 
-    // return measures.reduce((promise, [measure, desc]) => {
-    //     return promise.then(() => doMeasure(measure, desc, degrees, fingerings));
-    // }, Promise.resolve());
-    for(let [measure, desc] of measures) {
-        const currentContext = getContext();
-        if (
-            currentContext.key !== con.key ||
-            currentContext.major !== con.major ||
-            currentContext.lessonIndex !== con.lessonIndex
-        ) {
-            break;
-        }
-        await doMeasure(measure, desc, degrees, fingerings);
+  // return measures.reduce((promise, [measure, desc]) => {
+  //     return promise.then(() => doMeasure(measure, desc, degrees, fingerings));
+  // }, Promise.resolve());
+  for (let [measure, desc] of measures) {
+    const currentContext = getContext();
+    if (currentContext.key !== con.key || currentContext.major !== con.major || currentContext.lessonIndex !== con.lessonIndex) {
+      break;
     }
+    await doMeasure(measure, desc, degrees, fingerings);
+  }
 };
 var currentLessonIndex = 0;
 
-const lessons = [
-  {
-    title: "Lesson 1",
-    degrees: [0, 2, 3, 4, 5, 4, 3, 2],
-    fingerings: [1, 2, 3, 4, 5, 4, 3, 2],
-  },
-  {
-    title: "Lesson 2",
-    degrees: [0, 2, 5, 4, 3, 4, 3, 2],
-    fingerings: [1, 2, 5, 4, 3, 4, 3, 2],
-  },
-  {
-    title: "Lesson 3",
-    degrees: [0, 2, 5, 4, 3, 2, 3, 4],
-    fingerings: [1, 2, 5, 4, 3, 2, 3, 4],
-  },
-  {
-    title: "Lesson 4",
-    degrees: [0, 1, 0, 2, 5, 4, 3, 2],
-    fingerings: [1, 2, 1, 2, 5, 4, 3, 2],
-  },
-  {
-    title: "Lesson 5",
-    degrees: [0, 5, 4, 5, 3, 4, 2, 3],
-    fingerings: [1, 5, 4, 5, 3, 4, 2, 3],
-  },
-  {
-    title: "Lesson 6",
-    degrees: [0, 5, 4, 5, 3, 5, 2, 5],
-    fingerings: [1, 5, 4, 5, 3, 5, 2, 5],
-  },
-  {
-    title: "Lesson 7",
-    degrees: [0, 2, 1, 3, 2, 4, 3, 2],
-    fingerings: [1, 3, 2, 4, 3, 5, 4, 3],
-  },
 
-  {
-    title: "Lesson 8",
-    degrees: [0, 2, 4, 5, 3, 4, 2, 3],
-    fingerings: [1, 2, 4, 5, 3, 4, 2, 3],
-  },
-];
 
 function beep(duration, attack, release, frequency) {
   const audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
   // 1. Create a buffer of white noise.
   const bufferSize = (audioContext.sampleRate * duration) / 1000; // Duration in seconds
-  const noiseBuffer = audioContext.createBuffer(
-    1,
-    bufferSize,
-    audioContext.sampleRate
-  );
+  const noiseBuffer = audioContext.createBuffer(1, bufferSize, audioContext.sampleRate);
   const output = noiseBuffer.getChannelData(0);
   for (let i = 0; i < bufferSize; i++) {
     output[i] = Math.random() * 2 - 1; // Fill with random values between -1 and 1
@@ -222,14 +157,8 @@ function beep(duration, attack, release, frequency) {
   gainNode.connect(audioContext.destination);
 
   // 6. ASR envelope
-  gainNode.gain.linearRampToValueAtTime(
-    0.2,
-    audioContext.currentTime + attack / 1000
-  ); // Attack
-  gainNode.gain.linearRampToValueAtTime(
-    0,
-    audioContext.currentTime + (duration + attack) / 1000
-  ); // Release
+  gainNode.gain.linearRampToValueAtTime(0.2, audioContext.currentTime + attack / 1000); // Attack
+  gainNode.gain.linearRampToValueAtTime(0, audioContext.currentTime + (duration + attack) / 1000); // Release
 
   // 7. Start and stop the noise.
   noise.start();
@@ -262,6 +191,7 @@ const startLesson = async (lessonIndex) => {
   const { degrees, fingerings } = lesson;
   document.getElementById("lessonTitle").innerText = lesson.title;
   await doLesson(lessonIndex, degrees, fingerings);
+  next();
 };
 
 var next = (no_increment = false) => {
@@ -277,7 +207,7 @@ var next = (no_increment = false) => {
 const main = async () => {
   setupDebugOverlay();
 
-  const keysSelect = document.getElementById("keys");
+  const keysSelect = document.getElementById("allKeys");
   allNotes.forEach((note, index) => {
     const option = document.createElement("option");
     option.value = note;
@@ -303,11 +233,30 @@ const main = async () => {
     }
   });
 
-  document
-    .getElementById("majmin")
-    .addEventListener("change", () => next(true));
-  document.getElementById("keys").addEventListener("change", () => next(true));
-  document.getElementById("nextButton").addEventListener("click", ()=>next());
+  document.getElementById("majmin").addEventListener("change", () => next(true));
+  document.getElementById("allKeys").addEventListener("change", () => next(true));
+  document.getElementById("nextButton").addEventListener("click", () => next());
+
+  document.getElementById("showKeys").addEventListener("click", () => {
+    const pianoKeysContainer = document.getElementById("pianoKeysContainer");
+    if (!pianoKeysContainer.style.display || pianoKeysContainer.style.display === "none") {
+      pianoKeysContainer.style.display = "flex";
+      document.getElementById("showKeys").textContent = "Hide Hide";
+    } else {
+      pianoKeysContainer.style.display = "none";
+      document.getElementById("showKeys").textContent = "Show Piano";
+    }
+  });
+
+  var pianokeys = document.createElement("custom-piano-keys");
+  pianokeys.setAttribute("id", "pianoKeys");
+  pianokeys.setAttribute("oct-count", 5);
+  pianokeys.setAttribute("height", 50);
+
+  document.getElementById("pianoKeysContainer").appendChild(pianokeys);
+  
+//   document.getElementById("pianoKeysContainer").style.display = "flex";
+//   document.getElementById("allKeys").value = "G" //TODO: it doesn't work for other keys than C
 
   next(true);
 };

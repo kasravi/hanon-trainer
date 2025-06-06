@@ -76,7 +76,17 @@ function getNoteName(degree, scale, scaleName){
     return note;
 }
 
+function getNoteIndex(name){
+    if (name.length === 1) {
+        return notesWA.findIndex(f => f === name);
+    }
+    if (name.length === 2) {
+        return notesWA.findIndex(f => f.includes(name));
+    }
+}
+
 function getNote(degree, scale,scaleName, octave, duration = '4') {
+    //console.log(`getNote(${degree}, ${scale}, ${scaleName}, ${octave}, ${duration})`);
     octave += Math.floor(degree / (scale.length-1));
     const noteName = getNoteName(degree, scale, scaleName);
     return `${noteName}${octave}/${duration}`;
@@ -87,6 +97,7 @@ export {
     generateScaleFromDegree,
     getNote,
     getNoteName,
+    getNoteIndex,
     scales,
     notes,
     allNotes

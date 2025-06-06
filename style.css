@@ -145,17 +145,35 @@ select option {
     color: #333;
 }
 
+#lessonTitle{
+    text-align: center;
+    margin-bottom: 20px;
+    font-size: 1.5rem;
+    color: #35424a;
+}
+
 #tempoInput {
     width: 100px;
 }
 
+#pianoKeysContainer{
+    display: none;
+    justify-content: center;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 5px;
+}
+
 #controlContainer{
-    padding: 2rem;
     display: flex;
-    flex-direction: row;
+    flex-direction: column;
     justify-content: center;
     align-items: center;
     gap: 1rem;
+    position: fixed;
+    bottom: 0;
+    width:100%;
+    padding-bottom: 2rem;
 }
 
 

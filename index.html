@@ -1,29 +1,43 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mobile Web App</title>
-    <link rel="stylesheet" href="style.css">
-</head>
-<body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hanon Trainer</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
     <div id="output"></div>
+    <div id="pianoKeysContainer"></div>
     <div id="controlContainer">
+      <div>
         <p id="lessonTitle"></p>
-        <label for="tempoInput" >Tempo</label>
-        <input type="number" id="tempoInput" placeholder="Enter tempo (BPM)" value="60"/>
+        <label for="tempoInput">Tempo</label>
+        <input
+          type="number"
+          id="tempoInput"
+          placeholder="Enter tempo (BPM)"
+          value="60"
+        />
         <button id="startMetronome">Start Metronome</button>
-        <div id="rightControls">
-            <select id="majmin">
-                <option value="major" selected>Major</option>
-                <option value="minor">Minor</option>
-            </select>
-            <select id="keys"></select>
-            <button id="nextButton">Next</button>
-        </div>
-
+      </div>
+      <div>
+        <button id="showKeys">Show Piano</button>
+        <select id="majmin">
+          <option value="major" selected>Major</option>
+          <option value="minor">Minor</option>
+        </select>
+        <select id="allKeys"></select>
+        <button id="nextButton">Next</button>
+      </div>
     </div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/vexflow/4.2.5/vexflow-min.js" integrity="sha512-6TxXkXvDGlTfA/gxa+Odoa/so4d4/bjB6c5lgyZq8OVWqUVoDm2dC2PSI4g8Shlc2RZ6FnS1jh792Fo3HRINnw==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script
+      src="https://cdnjs.cloudflare.com/ajax/libs/vexflow/4.2.5/vexflow-min.js"
+      integrity="sha512-6TxXkXvDGlTfA/gxa+Odoa/so4d4/bjB6c5lgyZq8OVWqUVoDm2dC2PSI4g8Shlc2RZ6FnS1jh792Fo3HRINnw=="
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+    ></script>
+    <script defer src='custom-piano-keys.min.js'></script>
     <script src="script.js" type="module"></script>
-</body>
+  </body>
 </html>

@@ -3,7 +3,7 @@ const { Factory, EasyScore, System, Registry } = Vex.Flow;
 
 const draw = (scaleName, notes, fingerings, hl)=> {
 
-    console.log(notes)
+    // console.log("Drawing scale:", scaleName, notes, fingerings, hl);
     document.getElementById("output").innerHTML = ""
     const signture = "2/4"
 
