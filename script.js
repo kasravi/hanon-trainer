@@ -21,12 +21,26 @@ function parseMidiMessage(message) {
   };
 }
 
-var onMidiMessage = () => {};
-
 const setupMidiAccess = async () => {
-  const midiAccess = await navigator.requestMIDIAccess();
-  midiAccess.inputs.forEach((input) => input.addEventListener("midimessage", onMidiMessage));
-};
+    const midiAccess = await navigator.requestMIDIAccess();
+    midiAccess.inputs.forEach((input) => {
+      input.addEventListener("midimessage", (message) => handleMidiMessage(message));
+    });
+  };
+  
+  let currentMidiHandler = null;
+  
+  const handleMidiMessage = (message) => {
+    if (currentMidiHandler) {
+      currentMidiHandler(message);
+    } else {
+        console.warn("No MIDI handler set. Message ignored:", message);
+    }
+  };
+  
+  const setMidiHandler = (handler) => {
+    currentMidiHandler = handler;
+  };
 
 const doMeasure = async (measure, desc, degrees, fingerings) => {
   const key = document.getElementById("allKeys").value;
@@ -72,7 +86,7 @@ const doMeasure = async (measure, desc, degrees, fingerings) => {
         event.preventDefault();
         moveNoteForward(resolve, notes);
       });
-      onMidiMessage = (message) => {
+      const onMidiMessage = (message) => {
         //const [status, note, velocity] = message.data;
         const { command, channel, note, velocity } = parseMidiMessage(message);
 
@@ -94,6 +108,8 @@ const doMeasure = async (measure, desc, degrees, fingerings) => {
           moveNoteForward(resolve, notes);
         }
       };
+
+      setMidiHandler(onMidiMessage);
 
       //draw(scaleName, [notes("t", 3), notes("b", 2)], fingerings, highlightedNote);
       moveNoteForward(resolve, notes);
