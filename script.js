@@ -67,6 +67,8 @@ const doMeasure = async (measure, desc, degrees, fingerings) => {
         } else if (status === 128 || (status === 144 && velocity === 0)) {
           // Note Off
           activeNotes.delete(note);
+        } else {
+            return;
         }
         
         const trebleNote = getNote(degrees[highlightedNote], scale, scaleName, 4, 16);
