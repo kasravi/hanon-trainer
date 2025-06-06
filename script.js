@@ -100,10 +100,10 @@ const doMeasure = async (measure, desc, degrees, fingerings) => {
           return;
         }
 
-        const trebleNote = getNote(degrees[highlightedNote], scale, scaleName, 4, 16).split("/")[0];
-        const bassNote = getNote(degrees[highlightedNote], scale, scaleName, 3, 16).split("/")[0];
+        const trebleNote = getNote(degreesTr[highlightedNote], scale, scaleName, 4, 16).split("/")[0];
+        const bassNote = getNote(degreesTr[highlightedNote], scale, scaleName, 3, 16).split("/")[0];
 
-        console.log(degrees[highlightedNote], highlightedNote, scale, scaleName, parseMidiMessage(message));
+        console.log(degreesTr[highlightedNote], highlightedNote, degreesTr, parseMidiMessage(message));
         if (activeNotes.has(trebleNote) && activeNotes.has(bassNote)) {
           moveNoteForward(resolve, notes);
         }
