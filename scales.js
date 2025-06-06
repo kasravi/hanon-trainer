@@ -92,12 +92,28 @@ function getNote(degree, scale,scaleName, octave, duration = '4') {
     return `${noteName}${octave}/${duration}`;
 }
 
+function midiToNote(midiNote, scaleName) {
+    const octave = Math.floor(midiNote / 12) - 1;
+    const noteIndex = midiNote % 12;
+
+    let note = notesWA[noteIndex]
+    if (note.includes('/')) {
+        if(flatSclaes.includes(scaleName)) {
+            note = note.split('/')[1];
+        }
+        note = note.split('/')[0];
+    }
+
+    return `${note}${octave}`;
+}
+
 export {
     generateScale,
     generateScaleFromDegree,
     getNote,
     getNoteName,
     getNoteIndex,
+    midiToNote,
     scales,
     notes,
     allNotes

@@ -1,6 +1,6 @@
 import { setupDebugOverlay, writeToStorage, readFromStorage } from "./utils.js";
 import { draw } from "./render.js";
-import { generateScale, getNoteIndex, getNote, getNoteName, allNotes } from "./scales.js";
+import { generateScale, getNoteIndex, getNote, getNoteName, allNotes, midiToNote } from "./scales.js";
 import { lessons } from "./lessons.js";
 
 const range = (end, start) => {
@@ -71,18 +71,18 @@ const doMeasure = async (measure, desc, degrees, fingerings) => {
         //const [status, note, velocity] = message.data;
         const { command, channel, note, velocity } = parseMidiMessage(message);
 
-        if (command === 8 && velocity > 0) {
+        if (command === 9 && velocity > 0) {
           // Note On
-          activeNotes.add(note);
-        } else if (command === 9 || (command === 8 && velocity <= 0)) {
+          activeNotes.add(midiToNote(note, scaleName));
+        } else if (command === 8 || (command === 9 && velocity <= 0)) {
           // Note Off
-          activeNotes.delete(note);
+          activeNotes.delete(midiToNote(note, scaleName));
         } else {
             return;
         }
         
-        const trebleNote = getNote(degrees[highlightedNote], scale, scaleName, 4, 16);
-        const bassNote = getNote(degrees[highlightedNote], scale, scaleName, 3, 16);
+        const trebleNote = getNote(degrees[highlightedNote], scale, scaleName, 4, 16).split("/")[0];
+        const bassNote = getNote(degrees[highlightedNote], scale, scaleName, 3, 16).split("/")[0];
         
         console.log("Active Notes:", activeNotes, "Treble Note:", trebleNote, "Bass Note:", bassNote, "Message" ,parseMidiMessage(message));
         if (activeNotes.has(trebleNote) && activeNotes.has(bassNote)) {
@@ -271,6 +271,7 @@ const main = async () => {
 //   document.getElementById("allKeys").value = "G" //TODO: it doesn't work for other keys than C
 
   next(true);
+
 };
 
 document.addEventListener("DOMContentLoaded", main);
