@@ -12,6 +12,15 @@ const range = (end, start) => {
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function parseMidiMessage(message) {
+    return {
+      command: message.data[0] >> 4,
+      channel: message.data[0] & 0xf,
+      note: message.data[1],
+      velocity: message.data[2] / 127
+    }
+  }
+
 const doMeasure = async (measure, desc, degrees, fingerings) => {
   const key = document.getElementById("allKeys").value;
   const major = document.getElementById("majmin").value === "major";
@@ -59,12 +68,13 @@ const doMeasure = async (measure, desc, degrees, fingerings) => {
         moveNoteForward(resolve, notes);
       });
       const onMidiMessage = (message) => {
-        const [status, note, velocity] = message.data;
+        //const [status, note, velocity] = message.data;
+        const { command, channel, note, velocity } = parseMidiMessage(message);
 
-        if (status === 144 && velocity > 0) {
+        if (command === 8 && velocity > 0) {
           // Note On
           activeNotes.add(note);
-        } else if (status === 128 || (status === 144 && velocity === 0)) {
+        } else if (command === 9 || (command === 8 && velocity <= 0)) {
           // Note Off
           activeNotes.delete(note);
         } else {
@@ -74,7 +84,7 @@ const doMeasure = async (measure, desc, degrees, fingerings) => {
         const trebleNote = getNote(degrees[highlightedNote], scale, scaleName, 4, 16);
         const bassNote = getNote(degrees[highlightedNote], scale, scaleName, 3, 16);
         
-        console.log("Active Notes:", activeNotes, "Treble Note:", trebleNote, "Bass Note:", bassNote, "Message" ,message.data);
+        console.log("Active Notes:", activeNotes, "Treble Note:", trebleNote, "Bass Note:", bassNote, "Message" ,parseMidiMessage(message));
         if (activeNotes.has(trebleNote) && activeNotes.has(bassNote)) {
           moveNoteForward();
         }
