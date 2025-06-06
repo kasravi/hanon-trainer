@@ -66,6 +66,11 @@ function getNoteName(degree, scale, scaleName){
     
     let note = scale[degree];
 
+    if(!note) {
+        console.error(`Invalid degree: ${degree} for scale: ${scaleName}`);
+        return
+    }
+
     if (note.includes('/')) {
         if(flatSclaes.includes(scaleName)) {
             return note.split('/')[1];
