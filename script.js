@@ -21,6 +21,13 @@ function parseMidiMessage(message) {
   };
 }
 
+var onMidiMessage = () => {};
+
+const setupMidiAccess = async () => {
+  const midiAccess = await navigator.requestMIDIAccess();
+  midiAccess.inputs.forEach((input) => input.addEventListener("midimessage", onMidiMessage));
+};
+
 const doMeasure = async (measure, desc, degrees, fingerings) => {
   const key = document.getElementById("allKeys").value;
   const major = document.getElementById("majmin").value === "major";
@@ -52,8 +59,6 @@ const doMeasure = async (measure, desc, degrees, fingerings) => {
     activeNotes.clear();
   };
   try {
-    const midiAccess = await navigator.requestMIDIAccess();
-
     return new Promise((resolve) => {
       // wait(500).then(resolve)
       document.getElementById("output").addEventListener(
@@ -67,7 +72,7 @@ const doMeasure = async (measure, desc, degrees, fingerings) => {
         event.preventDefault();
         moveNoteForward(resolve, notes);
       });
-      const onMidiMessage = (message) => {
+      onMidiMessage = (message) => {
         //const [status, note, velocity] = message.data;
         const { command, channel, note, velocity } = parseMidiMessage(message);
 
@@ -81,16 +86,14 @@ const doMeasure = async (measure, desc, degrees, fingerings) => {
           return;
         }
 
-        const trebleNote = getNote(degreesTr[highlightedNote], scale, scaleName, 4, 16).split("/")[0];
-        const bassNote = getNote(degreesTr[highlightedNote], scale, scaleName, 3, 16).split("/")[0];
+        const trebleNote = getNote(degrees[highlightedNote], scale, scaleName, 4, 16).split("/")[0];
+        const bassNote = getNote(degrees[highlightedNote], scale, scaleName, 3, 16).split("/")[0];
 
-        console.log(degreesTr, highlightedNote, scale, scaleName, parseMidiMessage(message));
+        console.log(degrees[highlightedNote], highlightedNote, scale, scaleName, parseMidiMessage(message));
         if (activeNotes.has(trebleNote) && activeNotes.has(bassNote)) {
           moveNoteForward(resolve, notes);
         }
       };
-
-      midiAccess.inputs.forEach((input) => input.addEventListener("midimessage", onMidiMessage));
 
       //draw(scaleName, [notes("t", 3), notes("b", 2)], fingerings, highlightedNote);
       moveNoteForward(resolve, notes);
@@ -211,19 +214,20 @@ var next = (no_increment = false) => {
       currentLessonIndex = 0;
     }
   }
-  startLesson(currentLessonIndex).then(() => {
-    console.log("Lesson completed:", lessons[currentLessonIndex].title);
-    document.getElementById("nextButton").disabled = false;
-  }
-  ).catch((error) => {
-    console.error("Error in lesson:", error);
-    alert("An error occurred while processing the lesson. Please try again.");     
-  });
+  startLesson(currentLessonIndex)
+    .then(() => {
+      console.log("Lesson completed:", lessons[currentLessonIndex].title);
+      document.getElementById("nextButton").disabled = false;
+    })
+    .catch((error) => {
+      console.error("Error in lesson:", error);
+      alert("An error occurred while processing the lesson. Please try again.");
+    });
 };
 
 const main = async () => {
   setupDebugOverlay();
-
+  await setupMidiAccess();
   const keysSelect = document.getElementById("allKeys");
   allNotes.forEach((note, index) => {
     const option = document.createElement("option");
