@@ -3,33 +3,116 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Hanon Trainer</title>
+    <title>Piano Trainer</title>
     <link rel="stylesheet" href="style.css" />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap"
+    />
   </head>
   <body>
-    <div id="output"></div>
-    <div id="pianoKeysContainer"></div>
-    <div id="controlContainer">
-      <div>
-        <p id="lessonTitle"></p>
-        <label for="tempoInput">Tempo</label>
-        <input
-          type="number"
-          id="tempoInput"
-          placeholder="Enter tempo (BPM)"
-          value="60"
-        />
-        <button id="startMetronome">Start Metronome</button>
+    <div id="app">
+      <header class="top-bar">
+        <button id="lessonMenuButton" class="icon-button" aria-label="Lessons">Lessons</button>
+        <div class="brand">Piano Trainer</div>
+        <button id="settingsButton" class="icon-button" aria-label="Settings">Menu</button>
+      </header>
+      <main class="main">
+        <section id="homeScreen" class="screen active">
+          <div class="hero">
+            <div class="hero-title">Ready to play?</div>
+            <div class="hero-subtitle" id="currentPackLabel">Pack: Hanon Pack 1</div>
+            <button id="startButton" class="primary-button">Start</button>
+          </div>
+        </section>
+        <section id="practiceScreen" class="screen">
+          <div class="score-panel">
+            <div id="tempoIndicator" class="tempo-indicator">
+              <span id="tempoDot" class="tempo-dot"></span>
+              <span id="tempoLabel">Tempo 60 BPM</span>
+            </div>
+            <div id="playFeedback" class="play-feedback">Waiting for input</div>
+            <div id="scoreViewport">
+              <div id="output"></div>
+            </div>
+            <div id="pianoKeysContainer"></div>
+          </div>
+          <p id="lessonTitle"></p>
+        </section>
+        <section id="statsScreen" class="screen">
+          <div class="stats-panel">
+            <div class="hero-title">Lesson Stats</div>
+            <div id="statsList" class="stats-list"></div>
+            <button id="backFromStats" class="primary-button">Back</button>
+          </div>
+        </section>
+      </main>
+      <div id="lessonMenu" class="sheet hidden" aria-hidden="true">
+        <div class="sheet-header">
+          <div class="sheet-title">Lesson Packs</div>
+          <button class="icon-button" id="closeLessonMenu">Close</button>
+        </div>
+        <div id="lessonPackList" class="sheet-content"></div>
       </div>
-      <div>
-        <button id="showKeys">Show Piano</button>
-        <select id="majmin">
-          <option value="major" selected>Major</option>
-          <option value="minor">Minor</option>
-        </select>
-        <select id="allKeys"></select>
-        <button id="nextButton">Next</button>
+      <div id="settingsPanel" class="sheet hidden" aria-hidden="true">
+        <div class="sheet-header">
+          <div class="sheet-title">Settings</div>
+          <button class="icon-button" id="closeSettings">Close</button>
+        </div>
+        <div class="sheet-content">
+          <div class="settings-row">
+            <button id="showStatsButton">Show Lesson Stats</button>
+          </div>
+          <div class="settings-row">
+            <label for="practiceMode">Practice mode</label>
+            <select id="practiceMode">
+              <option value="read" selected>Read and play</option>
+              <option value="imitation">Imitation</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label for="tempoRatio">Tempo ratio (0.25x - 4x)</label>
+            <input type="range" id="tempoRatio" min="0.25" max="4" step="0.05" value="1" />
+            <div id="tempoRatioValue">1.00x</div>
+          </div>
+          <div class="settings-row">
+            <label for="allKeys">Transpose key</label>
+            <select id="allKeys"></select>
+          </div>
+          <div class="settings-row">
+            <label for="majmin">Scale type</label>
+            <select id="majmin">
+              <option value="major" selected>Major</option>
+              <option value="minor">Minor</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label for="showPianoToggle">Show piano keys in training</label>
+            <input type="checkbox" id="showPianoToggle" />
+          </div>
+          <div class="settings-row">
+            <button id="nextButton">Next lesson</button>
+            <button id="startMetronome">Start Metronome</button>
+          </div>
+          <div class="settings-row">
+            <label for="accuracyTarget">Accuracy target</label>
+            <input type="number" id="accuracyTarget" value="90" />
+          </div>
+          <div class="settings-row">
+            <label for="timingWindow">Timing window (ms)</label>
+            <input type="number" id="timingWindow" value="120" />
+          </div>
+          <div class="settings-row">
+            <label for="releaseWindow">Release window (ms)</label>
+            <input type="number" id="releaseWindow" value="150" />
+          </div>
+          <div class="settings-row">
+            <label for="midiInputSelect">Input device</label>
+            <select id="midiInputSelect"></select>
+          </div>
+        </div>
       </div>
+      <div id="sheetBackdrop" class="sheet-backdrop hidden"></div>
     </div>
     <script
       src="https://cdnjs.cloudflare.com/ajax/libs/vexflow/4.2.5/vexflow-min.js"
@@ -37,7 +120,7 @@
       crossorigin="anonymous"
       referrerpolicy="no-referrer"
     ></script>
-    <script defer src='custom-piano-keys.min.js'></script>
+    <script defer src="custom-piano-keys.min.js"></script>
     <script src="script.js" type="module"></script>
   </body>
 </html>

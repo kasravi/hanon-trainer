@@ -1,7 +1,8 @@
 const { Factory, EasyScore, System, Registry } = Vex.Flow;
+const VF = Vex.Flow;
 
 
-const draw = (scaleName, notes, fingerings, hl)=> {
+const draw = (scaleName, notes, fingerings, hl, currentStepState = "pending", noteStates = [], noteHints = [])=> {
 
     // console.log("Drawing scale:", scaleName, notes, fingerings, hl);
     document.getElementById("output").innerHTML = ""
@@ -38,19 +39,18 @@ const draw = (scaleName, notes, fingerings, hl)=> {
     score.set({ time: '2/4'});
     let system = vf.System({x,y,width:initWidth, spaceBetweenStaves: 10});
 
+    const trebleVoice = score.voice(score.beam(score.notes(notes[0], {stem: 'up'})));
+    const bassVoice = score.voice(score.beam(score.notes(notes[1], {stem: 'down', clef: 'bass'})));
+
+    trebleVoice.setStrict(false);
+    bassVoice.setStrict(false);
+
     system.addStave({
-        voices: [
-            //score.voice([score.beam(score.notes(notes[0], {stem: 'up'})),score.beam(score.notes(notes[0], {stem: 'up'}))].reduce(concat)),
-            score.voice(score.beam(score.notes(notes[0], {stem: 'up'}))),
-        ]
+        voices: [trebleVoice]
       }).addClef('treble').addKeySignature(scaleName).addTimeSignature(signture)
       
       system.addStave({
-        voices: [
-          //score.voice(score.notes('C#2/h, C#2', {clef: 'bass', stem: 'down'})),
-          //score.voice([score.beam(score.notes(notes[1], {stem: 'up'})),score.beam(score.notes(notes[1], {stem: 'up'}))].reduce(concat))
-          score.voice(score.beam(score.notes(notes[1], {stem: 'down', clef: 'bass'}))),
-        ]
+        voices: [bassVoice]
       }).addClef('bass').addKeySignature(scaleName).addTimeSignature(signture);
       
       system.addConnector('brace');
@@ -67,11 +67,35 @@ const draw = (scaleName, notes, fingerings, hl)=> {
     }
     id(noteId).addModifier(0, vf.Fingering({ number: fingering, position: 'above' }));
     id(bassId).addModifier(0, vf.Fingering({ number: 6-fingering, position: 'below' }));
+
+    const hintText = noteHints[i];
+    if (hintText) {
+      const annotation = new VF.Annotation(hintText)
+        .setVerticalJustification(VF.Annotation.VerticalJustify.TOP)
+        .setFont("Arial", 12, "normal");
+      id(noteId).addModifier(0, annotation);
+    }
+
+    const state = noteStates[i];
+    if (state === "correct") {
+      id(noteId).setStyle({ fillStyle: "green", strokeStyle: "green" });
+      id(bassId).setStyle({ fillStyle: "green", strokeStyle: "green" });
+    }
+    if (state === "wrong") {
+      id(noteId).setStyle({ fillStyle: "red", strokeStyle: "red" });
+      id(bassId).setStyle({ fillStyle: "red", strokeStyle: "red" });
+    }
   })
 
   if(hl!=null){
-  id(`nt${hl+1}`).setStyle({fillStyle: "blue", strokeStyle: "blue"})
-  id(`nb${hl+1}`).setStyle({fillStyle: "blue", strokeStyle: "blue"})
+  let color = "blue";
+  if (currentStepState === "correct") {
+    color = "green";
+  } else if (currentStepState === "wrong") {
+    color = "red";
+  }
+  id(`nt${hl+1}`).setStyle({fillStyle: color, strokeStyle: color})
+  id(`nb${hl+1}`).setStyle({fillStyle: color, strokeStyle: color})
   }
 //   console.log(id('n1'));
 //    id('nb1').addModifier(0,vf.Fingering({ number: '5', position: 'above' }))
