@@ -85,14 +85,31 @@ const state = {
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function parseMidiMessage(message) {
+const normalizeMidiMessage = (message, forcedInputId = null) => {
+  const rawData = message?.data;
+  if (!rawData || typeof rawData[0] !== "number") {
+    return null;
+  }
+
   return {
-    command: message.data[0] >> 4,
-    channel: message.data[0] & 0xf,
-    note: message.data[1],
-    velocity: message.data[2] / 127,
-    keyboardMeta: message.keyboardMeta || null,
-    inputId: message.inputId || null,
+    data: [rawData[0], rawData[1] ?? 0, rawData[2] ?? 0],
+    keyboardMeta: message?.keyboardMeta || null,
+    inputId: forcedInputId ?? message?.inputId ?? null,
+  };
+};
+
+function parseMidiMessage(message) {
+  const normalized = normalizeMidiMessage(message);
+  if (!normalized) {
+    return null;
+  }
+  return {
+    command: normalized.data[0] >> 4,
+    channel: normalized.data[0] & 0xf,
+    note: normalized.data[1],
+    velocity: normalized.data[2] / 127,
+    keyboardMeta: normalized.keyboardMeta,
+    inputId: normalized.inputId,
   };
 }
 
@@ -191,9 +208,14 @@ const togglePauseTraining = () => {
 };
 
 const handleMidiMessage = (message) => {
-  const status = message?.data?.[0] >> 4;
-  const note = message?.data?.[1];
-  const velocityRaw = message?.data?.[2] || 0;
+  const normalized = normalizeMidiMessage(message);
+  if (!normalized) {
+    return;
+  }
+
+  const status = normalized.data[0] >> 4;
+  const note = normalized.data[1];
+  const velocityRaw = normalized.data[2] || 0;
   const isNoteOn = status === 9 && velocityRaw > 0;
 
   if (state.isPracticeActive && isNoteOn && note === 24) {
@@ -201,7 +223,7 @@ const handleMidiMessage = (message) => {
     return;
   }
 
-  if (!isFromActiveInput(message)) {
+  if (!isFromActiveInput(normalized)) {
     return;
   }
 
@@ -213,10 +235,10 @@ const handleMidiMessage = (message) => {
     return;
   }
 
-  capturePerformedInput(message);
+  capturePerformedInput(normalized);
 
   if (currentMidiHandler) {
-    currentMidiHandler(message);
+    currentMidiHandler(normalized);
   }
 };
 
@@ -235,7 +257,11 @@ const attachAllMidiListeners = () => {
   }
   midiAccessRef.inputs.forEach((input) => {
     input.onmidimessage = (msg) => {
-      handleMidiMessage({ ...msg, inputId: input.id });
+      const normalized = normalizeMidiMessage(msg, input.id);
+      if (!normalized) {
+        return;
+      }
+      handleMidiMessage(normalized);
     };
   });
 };
@@ -1093,7 +1119,11 @@ const runSingleStep = ({
     }
 
     setMidiHandler((rawMessage) => {
-      const { command, note, velocity, keyboardMeta } = parseMidiMessage(rawMessage);
+      const parsed = parseMidiMessage(rawMessage);
+      if (!parsed) {
+        return;
+      }
+      const { command, note, velocity, keyboardMeta } = parsed;
       if (command !== 8 && command !== 9) {
         return;
       }
