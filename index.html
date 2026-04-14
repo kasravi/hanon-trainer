@@ -20,7 +20,6 @@
       <main class="main">
         <section id="homeScreen" class="screen active">
           <div class="hero">
-            <div class="hero-title">Ready to play?</div>
             <div class="hero-subtitle" id="currentPackLabel">Pack: Hanon Pack 1</div>
             <button id="startButton" class="primary-button">Start</button>
           </div>
@@ -103,6 +102,9 @@
             <button id="showStatsButton">Show Lesson Stats</button>
           </div>
           <div class="settings-row">
+            <button id="showLogsButton">Show Logs</button>
+          </div>
+          <div class="settings-row">
             <label for="visualMode">Training view</label>
             <select id="visualMode">
               <option value="notes" selected>Staff Notes</option>
@@ -160,6 +162,21 @@
             <label for="playInputSoundToggle">Play my input sound</label>
             <input type="checkbox" id="playInputSoundToggle" checked />
           </div>
+        </div>
+      </div>
+      <div id="logsPanel" class="sheet hidden" aria-hidden="true">
+        <div class="sheet-header">
+          <div class="sheet-title">Runtime Logs</div>
+          <button class="icon-button" id="closeLogs">Close</button>
+        </div>
+        <div class="sheet-content">
+          <div class="settings-row log-actions">
+            <button id="refreshLogsButton">Refresh</button>
+            <button id="clearLogsButton">Clear</button>
+            <button id="copyLogsButton">Copy</button>
+          </div>
+          <div id="logsMeta" class="log-meta">No logs yet</div>
+          <pre id="logsOutput" class="logs-output">No logs yet</pre>
         </div>
       </div>
       <div id="sheetBackdrop" class="sheet-backdrop hidden"></div>

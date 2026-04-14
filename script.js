@@ -1,4 +1,11 @@
-import { setupDebugOverlay, writeToStorage, readFromStorage } from "./utils.js";
+import {
+  initLogCapture,
+  getCapturedLogs,
+  clearCapturedLogs,
+  setupDebugOverlay,
+  writeToStorage,
+  readFromStorage,
+} from "./utils.js";
 import { draw } from "./render.js";
 import { generateScale, getNote, getNoteName, allNotes, midiToNote } from "./scales.js";
 import { lessonPacks, getPackById, getDefaultPackId } from "./lessons.js";
@@ -1600,7 +1607,34 @@ const syncSettingsToUI = () => {
   applyVisualMode();
 };
 
+const formatLogTime = (timestamp) => {
+  try {
+    return new Date(timestamp).toLocaleTimeString();
+  } catch (error) {
+    return "--:--:--";
+  }
+};
+
+const renderLogsPanel = () => {
+  if (!state.refs.logsOutput || !state.refs.logsMeta) {
+    return;
+  }
+  const logs = getCapturedLogs();
+  state.refs.logsMeta.textContent = `${logs.length} events captured`;
+  if (!logs.length) {
+    state.refs.logsOutput.textContent = "No logs yet";
+    return;
+  }
+
+  const content = logs
+    .map((entry) => `[${formatLogTime(entry.ts)}] [${entry.type}] ${entry.message}`)
+    .join("\n\n");
+  state.refs.logsOutput.textContent = content;
+  state.refs.logsOutput.scrollTop = state.refs.logsOutput.scrollHeight;
+};
+
 const main = async () => {
+  initLogCapture({ maxEntries: 1200 });
   setupDebugOverlay();
   await setupMidiAccess();
   setupComputerKeyboardInput();
@@ -1621,9 +1655,11 @@ const main = async () => {
     settingsButton: document.getElementById("settingsButton"),
     lessonMenu: document.getElementById("lessonMenu"),
     settingsPanel: document.getElementById("settingsPanel"),
+    logsPanel: document.getElementById("logsPanel"),
     sheetBackdrop: document.getElementById("sheetBackdrop"),
     closeLessonMenu: document.getElementById("closeLessonMenu"),
     closeSettings: document.getElementById("closeSettings"),
+    closeLogs: document.getElementById("closeLogs"),
     lessonPackList: document.getElementById("lessonPackList"),
     currentPackLabel: document.getElementById("currentPackLabel"),
     lessonTitle: document.getElementById("lessonTitle"),
@@ -1640,6 +1676,12 @@ const main = async () => {
     nextButton: document.getElementById("nextButton"),
     startMetronome: document.getElementById("startMetronome"),
     showStatsButton: document.getElementById("showStatsButton"),
+    showLogsButton: document.getElementById("showLogsButton"),
+    refreshLogsButton: document.getElementById("refreshLogsButton"),
+    clearLogsButton: document.getElementById("clearLogsButton"),
+    copyLogsButton: document.getElementById("copyLogsButton"),
+    logsOutput: document.getElementById("logsOutput"),
+    logsMeta: document.getElementById("logsMeta"),
     statsList: document.getElementById("statsList"),
     playFeedback: document.getElementById("playFeedback"),
     tempoDot: document.getElementById("tempoDot"),
@@ -1675,7 +1717,7 @@ const main = async () => {
   const openLessonsSheet = () => showSheet(state.refs.lessonMenu);
 
   const hideAllSheets = () => {
-    [state.refs.lessonMenu, state.refs.settingsPanel].forEach((sheet) => {
+    [state.refs.lessonMenu, state.refs.settingsPanel, state.refs.logsPanel].forEach((sheet) => {
       sheet.classList.remove("visible");
       sheet.classList.add("hidden");
     });
@@ -1707,6 +1749,7 @@ const main = async () => {
   state.refs.settingsButton.addEventListener("click", () => openMenuSheet());
   state.refs.closeLessonMenu.addEventListener("click", hideAllSheets);
   state.refs.closeSettings.addEventListener("click", hideAllSheets);
+  state.refs.closeLogs.addEventListener("click", hideAllSheets);
   state.refs.sheetBackdrop.addEventListener("click", hideAllSheets);
 
   state.refs.practiceMode.addEventListener("change", (event) => {
@@ -1791,6 +1834,35 @@ const main = async () => {
     renderStats();
     hideAllSheets();
     setActiveScreen(state.refs.statsScreen);
+  });
+
+  state.refs.showLogsButton.addEventListener("click", () => {
+    renderLogsPanel();
+    showSheet(state.refs.logsPanel);
+  });
+
+  state.refs.refreshLogsButton.addEventListener("click", () => {
+    renderLogsPanel();
+  });
+
+  state.refs.clearLogsButton.addEventListener("click", () => {
+    clearCapturedLogs();
+    renderLogsPanel();
+  });
+
+  state.refs.copyLogsButton.addEventListener("click", async () => {
+    const text = state.refs.logsOutput?.textContent || "";
+    if (!text || text === "No logs yet") {
+      updatePracticeFeedback("No logs to copy", "neutral");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      updatePracticeFeedback("Logs copied", "good");
+    } catch (error) {
+      updatePracticeFeedback("Copy failed (browser blocked clipboard)", "bad");
+      console.error("Copy logs failed", error);
+    }
   });
 
   state.refs.backFromStats.addEventListener("click", () => {
