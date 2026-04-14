@@ -70,9 +70,31 @@ function setupDebugOverlay() {
     }
   }
 
+  function buildStorageKey(key) {
+    return "piano-trainer-" + key;
+  }
+
+  function writeCookie(name, value, days = 365) {
+    const expires = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toUTCString();
+    document.cookie = `${name}=${encodeURIComponent(value)}; expires=${expires}; path=/; SameSite=Lax`;
+  }
+
+  function readCookie(name) {
+    const prefix = `${name}=`;
+    const parts = document.cookie.split(";").map((part) => part.trim());
+    const match = parts.find((part) => part.startsWith(prefix));
+    if (!match) {
+      return null;
+    }
+    return decodeURIComponent(match.slice(prefix.length));
+  }
+
   function writeToStorage(key, value) {
     if (typeof key === "string") {
-      localStorage.setItem("piano-trainer-" + key, JSON.stringify(value));
+        const storageKey = buildStorageKey(key);
+        const serialized = JSON.stringify(value);
+        localStorage.setItem(storageKey, serialized);
+        writeCookie(storageKey, serialized);
     } else {
       console.error("Key must be a string.");
     }
@@ -80,8 +102,24 @@ function setupDebugOverlay() {
   
   function readFromStorage(key) {
     if (typeof key === "string") {
-      const value = localStorage.getItem("piano-trainer-" + key);
-      return value ? JSON.parse(value) : null;
+        const storageKey = buildStorageKey(key);
+        const localValue = localStorage.getItem(storageKey);
+        if (localValue) {
+          return JSON.parse(localValue);
+        }
+
+        const cookieValue = readCookie(storageKey);
+        if (cookieValue) {
+          try {
+            const parsed = JSON.parse(cookieValue);
+            localStorage.setItem(storageKey, cookieValue);
+            return parsed;
+          } catch (error) {
+            console.warn("Failed to parse cookie storage value", error);
+          }
+        }
+
+        return null;
     } else {
       console.error("Key must be a string.");
       return null;

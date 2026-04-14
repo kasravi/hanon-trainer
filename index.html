@@ -27,15 +27,54 @@
         </section>
         <section id="practiceScreen" class="screen">
           <div class="score-panel">
+            <div id="scoreViewport">
+              <div id="outputExpected" class="staff-layer expected"></div>
+              <div id="outputPlayed" class="staff-layer played"></div>
+            </div>
+            <div id="pianoRollViewport" class="hidden">
+              <webaudio-pianoroll
+                id="pianoRollExpected"
+                width="1000"
+                height="280"
+                timebase="16"
+                xrange="16"
+                yrange="24"
+                yoffset="48"
+                editmode="dragpoly"
+                xscroll="1"
+                yscroll="0"
+                grid="4"
+                wheelzoom="0"
+                collt="rgba(200,220,255,0.35)"
+                coldk="rgba(170,200,255,0.35)"
+                colnote="#3c6df0"
+              ></webaudio-pianoroll>
+              <webaudio-pianoroll
+                id="pianoRollPlayed"
+                width="1000"
+                height="280"
+                timebase="16"
+                xrange="16"
+                yrange="24"
+                yoffset="48"
+                editmode="dragpoly"
+                xscroll="1"
+                yscroll="0"
+                grid="4"
+                wheelzoom="0"
+                collt="rgba(255,255,255,0)"
+                coldk="rgba(255,255,255,0)"
+                colnote="#16a34a"
+              ></webaudio-pianoroll>
+            </div>
+            <div id="pianoKeysContainer"></div>
+          </div>
+          <div id="trainingStatus" class="training-status">
+            <div id="playFeedback" class="play-feedback">Waiting for input</div>
             <div id="tempoIndicator" class="tempo-indicator">
               <span id="tempoDot" class="tempo-dot"></span>
               <span id="tempoLabel">Tempo 60 BPM</span>
             </div>
-            <div id="playFeedback" class="play-feedback">Waiting for input</div>
-            <div id="scoreViewport">
-              <div id="output"></div>
-            </div>
-            <div id="pianoKeysContainer"></div>
           </div>
           <p id="lessonTitle"></p>
         </section>
@@ -62,6 +101,13 @@
         <div class="sheet-content">
           <div class="settings-row">
             <button id="showStatsButton">Show Lesson Stats</button>
+          </div>
+          <div class="settings-row">
+            <label for="visualMode">Training view</label>
+            <select id="visualMode">
+              <option value="notes" selected>Staff Notes</option>
+              <option value="piano-roll">Piano Roll</option>
+            </select>
           </div>
           <div class="settings-row">
             <label for="practiceMode">Practice mode</label>
@@ -110,9 +156,23 @@
             <label for="midiInputSelect">Input device</label>
             <select id="midiInputSelect"></select>
           </div>
+          <div class="settings-row">
+            <label for="playInputSoundToggle">Play my input sound</label>
+            <input type="checkbox" id="playInputSoundToggle" checked />
+          </div>
         </div>
       </div>
       <div id="sheetBackdrop" class="sheet-backdrop hidden"></div>
+      <div id="pauseOverlay" class="pause-overlay hidden" aria-hidden="true">
+        <div class="pause-card">
+          <div class="hero-title">Paused</div>
+          <div class="hero-subtitle">Press Esc or lowest C to resume</div>
+          <div class="pause-actions">
+            <button id="resumeTrainingButton" class="primary-button">Resume</button>
+            <button id="stopTrainingButton">Stop</button>
+          </div>
+        </div>
+      </div>
     </div>
     <script
       src="https://cdnjs.cloudflare.com/ajax/libs/vexflow/4.2.5/vexflow-min.js"
@@ -121,6 +181,7 @@
       referrerpolicy="no-referrer"
     ></script>
     <script defer src="custom-piano-keys.min.js"></script>
+    <script src="https://g200kg.github.io/webaudio-pianoroll/webaudio-pianoroll.js"></script>
     <script src="script.js" type="module"></script>
   </body>
 </html>

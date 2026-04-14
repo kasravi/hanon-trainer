@@ -20,6 +20,8 @@ const keyboardTestMap = {
 
 const defaultSettings = {
   practiceMode: "read",
+  visualMode: "notes",
+  playInputSound: true,
   accuracyTarget: 90,
   timingWindow: 120,
   releaseWindow: 150,
@@ -47,6 +49,29 @@ const state = {
     schedulerId: null,
   },
   audioContext: null,
+  midiPollId: null,
+  isPaused: false,
+  lastPauseStartedAt: 0,
+  swipeStartX: null,
+  swipeStartY: null,
+  keyboardHandLatch: {
+    left: { verdict: "pending", at: 0 },
+    right: { verdict: "pending", at: 0 },
+  },
+  expectedRollSteps: [],
+  playedRollSequence: [],
+  currentStepCursor: -1,
+  currentNotation: null,
+  currentSteps: [],
+  performanceCapture: {
+    active: false,
+    startMs: 0,
+    endMs: 0,
+    stepMs: 0,
+    totalSteps: 0,
+    notes: [],
+    activeNotes: new Map(),
+  },
   settings: { ...defaultSettings },
   refs: {},
 };
@@ -60,6 +85,7 @@ function parseMidiMessage(message) {
     note: message.data[1],
     velocity: message.data[2] / 127,
     keyboardMeta: message.keyboardMeta || null,
+    inputId: message.inputId || null,
   };
 }
 
@@ -97,7 +123,91 @@ const setMidiHandler = (handler) => {
   currentMidiHandler = handler;
 };
 
+const isFromActiveInput = (message) => {
+  if (currentMidiInputId === virtualKeyboardInputId) {
+    return !message?.inputId;
+  }
+  return !!message?.inputId && message.inputId === currentMidiInputId;
+};
+
+const showPauseOverlay = () => {
+  if (!state.refs.pauseOverlay) {
+    return;
+  }
+  state.refs.pauseOverlay.classList.remove("hidden");
+  state.refs.pauseOverlay.setAttribute("aria-hidden", "false");
+};
+
+const hidePauseOverlay = () => {
+  if (!state.refs.pauseOverlay) {
+    return;
+  }
+  state.refs.pauseOverlay.classList.add("hidden");
+  state.refs.pauseOverlay.setAttribute("aria-hidden", "true");
+};
+
+const pauseTraining = () => {
+  if (!state.isPracticeActive || state.isPaused) {
+    return;
+  }
+  state.isPaused = true;
+  state.lastPauseStartedAt = performance.now();
+  showPauseOverlay();
+};
+
+const resumeTraining = () => {
+  if (!state.isPaused) {
+    return;
+  }
+  state.isPaused = false;
+  hidePauseOverlay();
+};
+
+const stopTraining = () => {
+  state.isPracticeActive = false;
+  state.isLessonRunning = false;
+  state.isPaused = false;
+  hidePauseOverlay();
+  setMidiHandler(null);
+  setActiveScreen(state.refs.homeScreen);
+};
+
+const togglePauseTraining = () => {
+  if (!state.isPracticeActive) {
+    return;
+  }
+  if (state.isPaused) {
+    resumeTraining();
+  } else {
+    pauseTraining();
+  }
+};
+
 const handleMidiMessage = (message) => {
+  const status = message?.data?.[0] >> 4;
+  const note = message?.data?.[1];
+  const velocityRaw = message?.data?.[2] || 0;
+  const isNoteOn = status === 9 && velocityRaw > 0;
+
+  if (state.isPracticeActive && isNoteOn && note === 24) {
+    togglePauseTraining();
+    return;
+  }
+
+  if (!isFromActiveInput(message)) {
+    return;
+  }
+
+  if (isNoteOn && state.settings.playInputSound) {
+    playPerformedNote(note, velocityRaw / 127);
+  }
+
+  if (state.isPaused) {
+    return;
+  }
+
+  capturePerformedInput(message);
+
   if (currentMidiHandler) {
     currentMidiHandler(message);
   }
@@ -112,21 +222,40 @@ const detachMidiListeners = () => {
   });
 };
 
-const attachSelectedMidiListener = () => {
-  if (!midiAccessRef || currentMidiInputId === virtualKeyboardInputId) {
+const attachAllMidiListeners = () => {
+  if (!midiAccessRef) {
     return;
   }
-  const input = midiAccessRef.inputs.get(currentMidiInputId);
-  if (input) {
-    input.onmidimessage = (msg) => handleMidiMessage(msg);
+  midiAccessRef.inputs.forEach((input) => {
+    input.onmidimessage = (msg) => {
+      handleMidiMessage({ ...msg, inputId: input.id });
+    };
+  });
+};
+
+const getConnectedMidiInputIds = () => {
+  if (!midiAccessRef) {
+    return [];
+  }
+  return Array.from(midiAccessRef.inputs.values()).map((input) => input.id);
+};
+
+const refreshMidiSelection = () => {
+  const ids = getConnectedMidiInputIds();
+  const hasSelected = currentMidiInputId && ids.includes(currentMidiInputId);
+  if (!hasSelected && currentMidiInputId !== virtualKeyboardInputId) {
+    currentMidiInputId = ids[0] || virtualKeyboardInputId;
+    writeToStorage("midi-input-id", currentMidiInputId);
   }
 };
 
 const setActiveMidiInput = (inputId) => {
   currentMidiInputId = inputId;
   writeToStorage("midi-input-id", inputId);
-  detachMidiListeners();
-  attachSelectedMidiListener();
+  attachAllMidiListeners();
+  if (state.refs?.midiInputSelect) {
+    state.refs.midiInputSelect.value = inputId;
+  }
 };
 
 const setupMidiAccess = async () => {
@@ -139,11 +268,26 @@ const setupMidiAccess = async () => {
   const fallbackInput = firstInput ? firstInput.id : virtualKeyboardInputId;
   const selected = storedInput && midiAccessRef.inputs.has(storedInput) ? storedInput : fallbackInput;
   setActiveMidiInput(selected);
+
+  midiAccessRef.onstatechange = () => {
+    refreshMidiSelection();
+    attachAllMidiListeners();
+    renderMidiInputOptions();
+  };
+
+  if (state.midiPollId) {
+    clearInterval(state.midiPollId);
+  }
+  state.midiPollId = setInterval(() => {
+    refreshMidiSelection();
+    attachAllMidiListeners();
+    renderMidiInputOptions();
+  }, 1000);
 };
 
 const setupComputerKeyboardInput = () => {
   document.addEventListener("keydown", (event) => {
-    if (currentMidiInputId !== virtualKeyboardInputId || event.repeat) {
+    if (currentMidiInputId !== virtualKeyboardInputId) {
       return;
     }
     const key = event.key.toLowerCase();
@@ -152,6 +296,10 @@ const setupComputerKeyboardInput = () => {
       return;
     }
     activeKeyboardKeys.add(key);
+    state.keyboardHandLatch[config.hand] = {
+      verdict: config.verdict,
+      at: performance.now(),
+    };
     handleMidiMessage(keyboardEventToMidiMessage(9, config.midi, 96, config));
   });
 
@@ -195,6 +343,210 @@ const scheduleClick = (ctx, atTimeSec, accent) => {
 
 const midiToFrequency = (midiNumber) => 440 * Math.pow(2, (midiNumber - 69) / 12);
 
+const midiToLabel = (midiNumber) => {
+  if (midiNumber == null) {
+    return "?";
+  }
+  const names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+  const octave = Math.floor(midiNumber / 12) - 1;
+  return `${names[midiNumber % 12]}${octave} (${midiNumber})`;
+};
+
+const startPerformanceCapture = (stepMs, totalSteps) => {
+  state.performanceCapture = {
+    active: true,
+    startMs: performance.now(),
+    endMs: 0,
+    stepMs,
+    totalSteps,
+    notes: [],
+    activeNotes: new Map(),
+  };
+};
+
+const stopPerformanceCapture = () => {
+  const capture = state.performanceCapture;
+  if (!capture.active) {
+    return;
+  }
+  const endMs = performance.now();
+  const relativeEnd = endMs - capture.startMs;
+  capture.activeNotes.forEach((active, midi) => {
+    capture.notes.push({
+      midi,
+      startMs: active.startMs,
+      endMs: Math.max(active.startMs + 10, relativeEnd),
+      handHint: active.handHint || null,
+    });
+  });
+  capture.activeNotes.clear();
+  capture.endMs = endMs;
+  capture.active = false;
+};
+
+const getCapturedNotesSnapshot = () => {
+  const capture = state.performanceCapture;
+  const nowRelative = performance.now() - capture.startMs;
+  const notes = capture.notes.map((n) => ({ ...n }));
+  capture.activeNotes.forEach((active, midi) => {
+    notes.push({
+      midi,
+      startMs: active.startMs,
+      endMs: Math.max(active.startMs + 10, nowRelative),
+      handHint: active.handHint || null,
+    });
+  });
+  return notes;
+};
+
+const decomposeUnits = (units) => {
+  const result = [];
+  let remaining = Math.max(0, Math.floor(units));
+  const chunks = [8, 4, 2, 1];
+  while (remaining > 0) {
+    const chunk = chunks.find((c) => c <= remaining) || 1;
+    result.push(chunk);
+    remaining -= chunk;
+  }
+  return result;
+};
+
+const unitsToDuration = (units) => {
+  if (units >= 8) return "2";
+  if (units >= 4) return "4";
+  if (units >= 2) return "8";
+  return "16";
+};
+
+const buildHandStaffSequence = (slots, scaleName, restToken) => {
+  const tokens = [];
+  let cursor = 0;
+  while (cursor < slots.length) {
+    const current = slots[cursor];
+    let runLength = 1;
+    while (cursor + runLength < slots.length && slots[cursor + runLength] === current) {
+      runLength += 1;
+    }
+    const chunks = decomposeUnits(runLength);
+    chunks.forEach((chunk) => {
+      const duration = unitsToDuration(chunk);
+      if (current == null) {
+        tokens.push(`${restToken}/${duration}/r`);
+      } else {
+        tokens.push(`${midiToNote(current, scaleName)}/${duration}`);
+      }
+    });
+    cursor += runLength;
+  }
+  if (!tokens.length) {
+    tokens.push(`${restToken}/4/r`);
+  }
+  return tokens.join(", ");
+};
+
+const buildPlayedLayerNotation = (scaleName, totalSteps) => {
+  const capture = state.performanceCapture;
+  const slotsLeft = Array.from({ length: totalSteps }, () => null);
+  const slotsRight = Array.from({ length: totalSteps }, () => null);
+  const slotStartLeft = Array.from({ length: totalSteps }, () => -Infinity);
+  const slotStartRight = Array.from({ length: totalSteps }, () => -Infinity);
+  const stepMs = capture.stepMs || 1;
+  const notes = getCapturedNotesSnapshot();
+
+  notes.forEach((note) => {
+    const startSlot = Math.max(0, Math.floor(note.startMs / stepMs));
+    const endSlot = Math.min(totalSteps - 1, Math.ceil(note.endMs / stepMs) - 1);
+    if (endSlot < startSlot) {
+      return;
+    }
+    const hand = note.handHint || (note.midi >= 58 ? "right" : "left");
+    for (let slot = startSlot; slot <= endSlot; slot++) {
+      if (hand === "right") {
+        if (note.startMs >= slotStartRight[slot]) {
+          slotStartRight[slot] = note.startMs;
+          slotsRight[slot] = note.midi;
+        }
+      } else {
+        if (note.startMs >= slotStartLeft[slot]) {
+          slotStartLeft[slot] = note.startMs;
+          slotsLeft[slot] = note.midi;
+        }
+      }
+    }
+  });
+
+  return {
+    treble: buildHandStaffSequence(slotsRight, scaleName, "B4"),
+    bass: buildHandStaffSequence(slotsLeft, scaleName, "D3"),
+  };
+};
+
+const buildPlayedRollSequence = (totalSteps) => {
+  const capture = state.performanceCapture;
+  const stepMs = capture.stepMs || 1;
+  return getCapturedNotesSnapshot()
+    .map((note) => {
+      const t = Math.max(0, note.startMs / stepMs);
+      const g = Math.max(0.1, (note.endMs - note.startMs) / stepMs);
+      return { t, g, n: note.midi };
+    })
+    .filter((event) => event.t <= totalSteps + 0.5);
+};
+
+const capturePerformedInput = (message) => {
+  const capture = state.performanceCapture;
+  if (!capture.active) {
+    return;
+  }
+
+  const status = message?.data?.[0] >> 4;
+  const note = message?.data?.[1];
+  const velocityRaw = message?.data?.[2] || 0;
+  if (status !== 8 && status !== 9) {
+    return;
+  }
+
+  const isNoteOn = status === 9 && velocityRaw > 0;
+  const nowRelative = performance.now() - capture.startMs;
+  const keyboardHand = message?.keyboardMeta?.hand || null;
+
+  if (isNoteOn) {
+    if (!capture.activeNotes.has(note)) {
+      capture.activeNotes.set(note, {
+        startMs: Math.max(0, nowRelative),
+        handHint: keyboardHand,
+      });
+    }
+  } else {
+    const active = capture.activeNotes.get(note);
+    if (active) {
+      capture.notes.push({
+        midi: note,
+        startMs: active.startMs,
+        endMs: Math.max(active.startMs + 10, nowRelative),
+        handHint: active.handHint || keyboardHand,
+      });
+      capture.activeNotes.delete(note);
+    }
+  }
+
+  const totalSteps = capture.totalSteps || 1;
+  state.playedRollSequence = buildPlayedRollSequence(totalSteps);
+  if (state.currentNotation && state.currentSteps.length) {
+    const playedNotation = buildPlayedLayerNotation(state.currentNotation.scaleName, state.currentSteps.length);
+    renderStaffLayers(
+      state.currentNotation,
+      state.currentSteps,
+      Math.max(0, state.currentStepCursor),
+      "pending",
+      [],
+      [],
+      playedNotation
+    );
+    renderPianoRoll(state.expectedRollSteps, state.currentStepCursor);
+  }
+};
+
 const noteNameWithOctaveToMidi = (noteName, octave) => {
   const semitone = noteToSemitone[noteName];
   if (semitone === undefined) {
@@ -224,6 +576,9 @@ const schedulePianoNote = (ctx, midiNumber, atTimeSec, durationSec = 0.22, veloc
 };
 
 const playPerformedNote = (midiNumber, velocity = 0.7) => {
+  if (!state.settings.playInputSound) {
+    return;
+  }
   const ctx = getAudioContext();
   const now = ctx.currentTime + 0.002;
   schedulePianoNote(ctx, midiNumber, now, 0.18, Math.max(0.2, velocity));
@@ -367,11 +722,99 @@ const updateTempoLabel = (bpm, ratio) => {
   }
 };
 
-const markPianoKeys = (step) => {
+const applyVisualMode = () => {
+  const isPianoRoll = state.settings.visualMode === "piano-roll";
+  if (state.refs.scoreViewport) {
+    state.refs.scoreViewport.classList.toggle("hidden", isPianoRoll);
+  }
+  if (state.refs.pianoRollViewport) {
+    state.refs.pianoRollViewport.classList.toggle("hidden", !isPianoRoll);
+  }
+};
+
+const renderStaffLayers = (
+  notation,
+  steps,
+  index,
+  currentState = "pending",
+  noteStates = [],
+  noteHints = [],
+  playedLayerNotation = null
+) => {
+  const fingerings = steps.map((s) => s.fingering);
+  draw(
+    notation.scaleName,
+    [notation.treble, notation.bass],
+    fingerings,
+    index,
+    "pending",
+    [],
+    [],
+    { elementId: "outputExpected", showFingerings: true, showHints: false }
+  );
+
+  draw(
+    notation.scaleName,
+    [playedLayerNotation?.treble || notation.treble, playedLayerNotation?.bass || notation.bass],
+    playedLayerNotation ? [] : fingerings,
+    playedLayerNotation ? null : index,
+    playedLayerNotation ? "pending" : currentState,
+    playedLayerNotation ? [] : noteStates,
+    playedLayerNotation ? [] : noteHints,
+    { elementId: "outputPlayed", showFingerings: false, showHints: false }
+  );
+};
+
+const renderPianoRoll = (steps, currentIndex = -1) => {
+  if (!state.refs.pianoRollExpected || !state.refs.pianoRollPlayed) {
+    return;
+  }
+  const expectedRoll = state.refs.pianoRollExpected;
+  const playedRoll = state.refs.pianoRollPlayed;
+  const total = Math.max(steps.length, 1);
+
+  if (currentIndex < 0) {
+    expectedRoll.sequence = [];
+    steps.forEach((step, index) => {
+      expectedRoll.sequence.push({ t: index, g: 1, n: step.rightMidi || 60 });
+      expectedRoll.sequence.push({ t: index, g: 1, n: step.leftMidi || 48 });
+    });
+    expectedRoll.setAttribute("timebase", String(total));
+    expectedRoll.setAttribute("xrange", String(Math.max(16, total + 4)));
+    expectedRoll.setAttribute("markend", String(total));
+    if (typeof expectedRoll.redraw === "function") {
+      expectedRoll.redraw();
+    }
+
+  }
+
+  playedRoll.sequence = Array.isArray(state.playedRollSequence) ? [...state.playedRollSequence] : [];
+  playedRoll.setAttribute("timebase", String(total));
+  playedRoll.setAttribute("xrange", String(Math.max(16, total + 4)));
+  playedRoll.setAttribute("markend", String(total));
+  if (typeof playedRoll.redraw === "function") {
+    playedRoll.redraw();
+  }
+
+  if (typeof expectedRoll.locate === "function") {
+    expectedRoll.locate(Math.max(0, currentIndex));
+  } else {
+    expectedRoll.setAttribute("cursor", String(Math.max(0, currentIndex)));
+  }
+
+  if (typeof playedRoll.locate === "function") {
+    playedRoll.locate(Math.max(0, currentIndex));
+  } else {
+    playedRoll.setAttribute("cursor", String(Math.max(0, currentIndex)));
+  }
+};
+
+const markPianoKeys = (step, color = "#3c6df0") => {
   const piano = document.getElementById("pianoKeys");
   if (!piano) {
     return;
   }
+  piano.setAttribute("mark-color", color);
   const [scale, scaleName] = getCurrentScale();
   const rightNoteName = getNoteName(step.degree + 1, scale, scaleName);
   const leftNoteName = getNoteName(step.leftDegree + 1, scale, scaleName);
@@ -393,8 +836,10 @@ const playDemo = async (steps, notation, bpm) => {
       await wait(waitMs);
     }
 
-    draw(notation.scaleName, [notation.treble, notation.bass], steps.map((s) => s.fingering), index, "pending");
-    markPianoKeys(steps[index]);
+    renderPianoRoll(state.expectedRollSteps, index);
+    const playedNotation = buildPlayedLayerNotation(notation.scaleName, steps.length);
+    renderStaffLayers(notation, steps, index, "pending", [], [], playedNotation);
+    markPianoKeys(steps[index], "#3c6df0");
     const atTimeSec = ctx.currentTime + 0.01;
     const durationSec = Math.max(0.12, (stepMs / 1000) * 0.85);
     schedulePianoNote(ctx, notation.expected[index]?.leftMidi, atTimeSec, durationSec, 0.55);
@@ -403,7 +848,57 @@ const playDemo = async (steps, notation, bpm) => {
   }
 };
 
-const runSingleStep = ({ expected, stepIndex, notation, steps, bpm, stepStart, noteStates, noteHints }) => {
+const describeTiming = (deltaMs, timingWindow) => {
+  if (deltaMs == null) {
+    return "";
+  }
+  const absDelta = Math.abs(deltaMs);
+  if (absDelta <= timingWindow * 0.4) {
+    return "⏱ on";
+  }
+  if (deltaMs < -timingWindow * 1.5) {
+    return "⏱ very early";
+  }
+  if (deltaMs < -timingWindow) {
+    return "⏱ early";
+  }
+  if (deltaMs > timingWindow * 1.5) {
+    return "⏱ very late";
+  }
+  if (deltaMs > timingWindow) {
+    return "⏱ late";
+  }
+  return "";
+};
+
+const describeVelocity = (velocity) => {
+  if (velocity == null) {
+    return "";
+  }
+  if (velocity < 0.2) {
+    return "🔉 very soft";
+  }
+  if (velocity < 0.35) {
+    return "🔉 soft";
+  }
+  if (velocity > 0.92) {
+    return "🔊 hard";
+  }
+  return "";
+};
+
+const runSingleStep = ({
+  expected,
+  step,
+  stepIndex,
+  notation,
+  steps,
+  bpm,
+  stepStart,
+  noteStates,
+  noteHints,
+  waitForBarStart = false,
+}) => {
   const timingWindow = Number(state.settings.timingWindow);
   const releaseWindow = Number(state.settings.releaseWindow);
   const stepMs = 60000 / bpm / 2;
@@ -411,61 +906,184 @@ const runSingleStep = ({ expected, stepIndex, notation, steps, bpm, stepStart, n
 
   return new Promise((resolve) => {
     const hand = { left: "pending", right: "pending" };
-    let pressureHits = 0;
-    let firstOnsetDeltaMs = null;
-    let firstVelocity = null;
+    const handVelocity = { left: null, right: null };
+    const handOnsetDelta = { left: null, right: null };
+    const handReleaseDelta = { left: null, right: null };
     let stepFailed = false;
 
-    const timeoutDelay = Math.max(0, stepMs - (performance.now() - stepStart));
+    let effectiveStepStart = stepStart;
+    let timeout = null;
+    let pauseAnchor = null;
+    const receivedEvents = [];
+    const onsetTargetMs = state.settings.practiceMode === "imitation" && stepIndex === 0 ? stepMs : 0;
 
-    const timeout = setTimeout(() => {
-      setMidiHandler(null);
-      const onsetDelta = firstOnsetDeltaMs ?? timeoutDelay;
-      const timingBad = Math.abs(onsetDelta) > timingWindow;
-      const releaseBad = !(releaseState.left && releaseState.right);
-      const velocityBad = firstVelocity != null && firstVelocity < 0.35;
-      const hintParts = [];
+    console.log(`[Step ${stepIndex + 1}] EXPECTED`, {
+      right: { name: expected.right, midi: expected.rightMidi, label: midiToLabel(expected.rightMidi) },
+      left: { name: expected.left, midi: expected.leftMidi, label: midiToLabel(expected.leftMidi) },
+      bpm,
+      stepMs,
+      onsetTargetMs,
+      timingWindow,
+      releaseWindow,
+      mode: state.settings.practiceMode,
+      input: currentMidiInputId,
+    });
 
-      if (timingBad) {
-        hintParts.push(onsetDelta > 0 ? `⏱+${Math.round(onsetDelta)}` : `⏱${Math.round(onsetDelta)}`);
-      }
-      if (velocityBad) {
-        hintParts.push("🔉");
-      }
-      if (releaseBad) {
-        hintParts.push("⟂");
-      }
-
-      if (stepFailed || hand.left !== "correct" || hand.right !== "correct") {
-        noteStates[stepIndex] = "wrong";
-        if (!hintParts.length) {
-          hintParts.push("✗note");
+    if (currentMidiInputId === virtualKeyboardInputId) {
+      const latchWindowMs = 140;
+      const now = performance.now();
+      ["left", "right"].forEach((handName) => {
+        const latch = state.keyboardHandLatch[handName];
+        if (now - latch.at <= latchWindowMs && latch.verdict !== "pending") {
+          hand[handName] = latch.verdict;
         }
-        noteHints[stepIndex] = hintParts.join(" ");
-        updatePracticeFeedback(`Step ${stepIndex + 1}: ${noteHints[stepIndex]}`, "bad");
-      } else {
-        noteStates[stepIndex] = "correct";
-        noteHints[stepIndex] = hintParts.join(" ");
+      });
+    }
+
+    const finalizeStep = () => {
+      if (state.isPaused) {
+        if (pauseAnchor == null) {
+          pauseAnchor = performance.now();
+        }
+        timeout = setTimeout(finalizeStep, 80);
+        return;
       }
 
-      draw(
-        notation.scaleName,
-        [notation.treble, notation.bass],
-        steps.map((s) => s.fingering),
-        stepIndex,
-        noteStates[stepIndex],
-        noteStates,
-        noteHints
+      if (pauseAnchor != null) {
+        const pausedDuration = performance.now() - pauseAnchor;
+        effectiveStepStart += pausedDuration;
+        pauseAnchor = null;
+      }
+
+      setMidiHandler(null);
+
+      const now = performance.now();
+      const handResult = ["left", "right"].reduce(
+        (acc, handName) => {
+          const isMissed = hand[handName] === "pending";
+          const isWrong = hand[handName] === "wrong";
+          const adjustedOnsetDelta =
+            handOnsetDelta[handName] == null ? null : handOnsetDelta[handName] - onsetTargetMs;
+          const timingText = describeTiming(adjustedOnsetDelta, timingWindow);
+          const velocityText = describeVelocity(handVelocity[handName]);
+          const releaseDelta = handReleaseDelta[handName];
+          const releaseText =
+            releaseDelta == null || releaseDelta > stepMs + releaseWindow
+              ? "⟂ release"
+              : "";
+
+          const hints = [];
+          if (isMissed) {
+            hints.push("∅ missed");
+          }
+          if (timingText && !isMissed) {
+            hints.push(timingText);
+          }
+          if (velocityText && !isMissed) {
+            hints.push(velocityText);
+          }
+          if (releaseText && !isMissed) {
+            hints.push(releaseText);
+          }
+          if (isWrong) {
+            hints.push("✗note");
+          }
+
+          const badTiming = adjustedOnsetDelta != null && Math.abs(adjustedOnsetDelta) > timingWindow;
+          const badVelocity = handVelocity[handName] != null && handVelocity[handName] < 0.35;
+          const badRelease = releaseDelta == null || releaseDelta > stepMs + releaseWindow;
+          const isCorrect = !isMissed && !isWrong;
+          const ok = isCorrect && !badTiming && !badVelocity && !badRelease;
+
+          acc.noteHits += isCorrect ? 1 : 0;
+          acc.onsetHit += !badTiming && isCorrect ? 1 : 0;
+          acc.pressureHit += !badVelocity && isCorrect ? 1 : 0;
+          acc.releaseHit += !badRelease && isCorrect ? 1 : 0;
+          acc.ok = acc.ok && ok;
+
+          acc.states[handName] = isMissed ? "missed" : isWrong ? "wrong" : "correct";
+          acc.hints[handName] = hints.join(" ");
+          return acc;
+        },
+        {
+          noteHits: 0,
+          onsetHit: 0,
+          pressureHit: 0,
+          releaseHit: 0,
+          ok: !stepFailed,
+          states: { left: "pending", right: "pending" },
+          hints: { left: "", right: "" },
+        }
       );
-      resolve({
-        ok: noteStates[stepIndex] === "correct" && !timingBad,
-        noteHits: noteStates[stepIndex] === "correct" ? 2 : [hand.left, hand.right].filter((v) => v === "correct").length,
-        noteTotal: 2,
-        onsetHit: timingBad ? 0 : 1,
-        pressureHit: velocityBad ? 0 : pressureHits > 0 ? 1 : 0,
-        releaseHit: releaseBad ? 0 : 1,
+
+      noteStates[stepIndex] = handResult.states;
+      noteHints[stepIndex] = handResult.hints;
+
+      const noteOnlyOk = handResult.states.left === "correct" && handResult.states.right === "correct";
+      const feedbackParts = [handResult.hints.right, handResult.hints.left].filter(Boolean);
+      if (feedbackParts.length) {
+        updatePracticeFeedback(`Step ${stepIndex + 1}: ${feedbackParts.join(" | ")}`, handResult.ok ? "good" : "bad");
+      }
+
+      console.log(`[Step ${stepIndex + 1}] RESULT`, {
+        receivedEvents,
+        handState: hand,
+        handOnsetDelta,
+        adjustedHandOnsetDelta: {
+          left: handOnsetDelta.left == null ? null : handOnsetDelta.left - onsetTargetMs,
+          right: handOnsetDelta.right == null ? null : handOnsetDelta.right - onsetTargetMs,
+        },
+        onsetTargetMs,
+        handVelocity,
+        handReleaseDelta,
+        gradedStates: handResult.states,
+        gradedHints: handResult.hints,
+        scores: {
+          noteHits: handResult.noteHits,
+          onsetHit: handResult.onsetHit,
+          pressureHit: handResult.pressureHit,
+          releaseHit: handResult.releaseHit,
+          noteOnlyOk,
+          ok: handResult.ok,
+        },
       });
-    }, timeoutDelay);
+
+      const pianoColor = handResult.ok ? "#22c55e" : "#ef4444";
+      markPianoKeys(step, pianoColor);
+
+      const playedNotation = buildPlayedLayerNotation(notation.scaleName, steps.length);
+      renderStaffLayers(
+        notation,
+        steps,
+        stepIndex,
+        handResult.ok ? "correct" : "wrong",
+        noteStates,
+        noteHints,
+        playedNotation
+      );
+
+      resolve({
+        ok: currentMidiInputId === virtualKeyboardInputId ? noteOnlyOk : handResult.ok,
+        noteOnlyOk,
+        noteHits: handResult.noteHits,
+        noteTotal: 2,
+        onsetHit: handResult.onsetHit,
+        pressureHit: handResult.pressureHit,
+        releaseHit: handResult.releaseHit,
+      });
+    };
+
+    const scheduleFinalize = () => {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      const timeoutDelay = Math.max(0, stepMs - (performance.now() - effectiveStepStart));
+      timeout = setTimeout(finalizeStep, timeoutDelay);
+    };
+
+    if (!waitForBarStart) {
+      scheduleFinalize();
+    }
 
     setMidiHandler((rawMessage) => {
       const { command, note, velocity, keyboardMeta } = parseMidiMessage(rawMessage);
@@ -473,70 +1091,117 @@ const runSingleStep = ({ expected, stepIndex, notation, steps, bpm, stepStart, n
         return;
       }
 
-      if (currentMidiInputId === virtualKeyboardInputId && keyboardMeta) {
-        if (command === 9 && velocity > 0) {
-          playPerformedNote(note, velocity);
-          hand[keyboardMeta.hand] = keyboardMeta.verdict;
-          pressureHits += 1;
-          if (firstOnsetDeltaMs == null) {
-            firstOnsetDeltaMs = performance.now() - stepStart;
-          }
-          firstVelocity = velocity;
-          updatePracticeFeedback(`${keyboardMeta.hand} hand: ${keyboardMeta.verdict}`, keyboardMeta.verdict === "correct" ? "good" : "bad");
-        } else {
-          releaseState[keyboardMeta.hand] = true;
-        }
-      } else {
-        const noteName = midiToNote(note, notation.scaleName);
-        if (command === 9 && velocity > 0) {
-          playPerformedNote(note, velocity);
-          const matchedRight = noteName === expected.right;
-          const matchedLeft = noteName === expected.left;
-          const noteHand = note >= 60 ? "right" : "left";
-          if (matchedRight) {
-            hand.right = "correct";
-          } else if (matchedLeft) {
-            hand.left = "correct";
-          } else {
-            hand[noteHand] = "wrong";
-          }
-          pressureHits += velocity >= 0.35 ? 1 : 0;
-          if (firstOnsetDeltaMs == null) {
-            firstOnsetDeltaMs = performance.now() - stepStart;
-          }
-          firstVelocity = velocity;
-          updatePracticeFeedback(`Played ${noteName}`, matchedLeft || matchedRight ? "good" : "bad");
-        } else {
-          const noteHand = note >= 60 ? "right" : "left";
-          releaseState[noteHand] = true;
-        }
-      }
-
-      if (hand.left === "wrong" || hand.right === "wrong") {
-        stepFailed = true;
-        noteStates[stepIndex] = "wrong";
-        draw(
-          notation.scaleName,
-          [notation.treble, notation.bass],
-          steps.map((s) => s.fingering),
-          stepIndex,
-          "wrong",
-          noteStates,
-          noteHints
-        );
+      const eventTime = performance.now();
+      if (eventTime < effectiveStepStart - 5) {
         return;
       }
 
+      const isNoteOn = command === 9 && velocity > 0;
+      if (waitForBarStart && isNoteOn && hand.left === "pending" && hand.right === "pending") {
+        effectiveStepStart = performance.now();
+        scheduleFinalize();
+      }
+
+      if (waitForBarStart && !timeout) {
+        return;
+      }
+
+      if (currentMidiInputId === virtualKeyboardInputId && keyboardMeta) {
+        if (isNoteOn) {
+          receivedEvents.push({
+            atMs: Math.round(performance.now()),
+            type: "on",
+            hand: keyboardMeta.hand,
+            verdict: keyboardMeta.verdict,
+            note,
+            label: midiToLabel(note),
+            velocity,
+          });
+          hand[keyboardMeta.hand] = keyboardMeta.verdict;
+          handOnsetDelta[keyboardMeta.hand] = performance.now() - effectiveStepStart;
+          handVelocity[keyboardMeta.hand] = velocity;
+          if (hand[keyboardMeta.hand] !== "correct") {
+            stepFailed = true;
+          }
+          updatePracticeFeedback(`${keyboardMeta.hand} hand: ${keyboardMeta.verdict}`, keyboardMeta.verdict === "correct" ? "good" : "bad");
+        } else {
+          if (handOnsetDelta[keyboardMeta.hand] != null) {
+            receivedEvents.push({
+              atMs: Math.round(performance.now()),
+              type: "off",
+              hand: keyboardMeta.hand,
+              note,
+              label: midiToLabel(note),
+            });
+            releaseState[keyboardMeta.hand] = true;
+            handReleaseDelta[keyboardMeta.hand] = performance.now() - effectiveStepStart;
+          }
+        }
+      } else {
+        const noteName = midiToNote(note, notation.scaleName);
+        if (isNoteOn) {
+          receivedEvents.push({
+            atMs: Math.round(performance.now()),
+            type: "on",
+            note,
+            label: midiToLabel(note),
+            noteName,
+            velocity,
+          });
+          const matchedRight = note === expected.rightMidi;
+          const matchedLeft = note === expected.leftMidi;
+
+          let noteHand = null;
+          if (matchedRight) {
+            hand.right = "correct";
+            noteHand = "right";
+          } else if (matchedLeft) {
+            hand.left = "correct";
+            noteHand = "left";
+          } else {
+            const proximityRight = Math.abs(note - expected.rightMidi);
+            const proximityLeft = Math.abs(note - expected.leftMidi);
+            noteHand = proximityLeft <= proximityRight ? "left" : "right";
+            hand[noteHand] = "wrong";
+            stepFailed = true;
+          }
+          if (noteHand) {
+            handOnsetDelta[noteHand] = performance.now() - effectiveStepStart;
+            handVelocity[noteHand] = velocity;
+            const delta = handOnsetDelta[noteHand];
+          }
+          updatePracticeFeedback(`Played ${noteName}`, matchedLeft || matchedRight ? "good" : "bad");
+        } else {
+          const noteHand = Math.abs(note - expected.leftMidi) <= Math.abs(note - expected.rightMidi) ? "left" : "right";
+          if (handOnsetDelta[noteHand] != null) {
+            receivedEvents.push({
+              atMs: Math.round(performance.now()),
+              type: "off",
+              note,
+              label: midiToLabel(note),
+              noteName,
+            });
+            releaseState[noteHand] = true;
+            handReleaseDelta[noteHand] = performance.now() - effectiveStepStart;
+          }
+        }
+      }
+
       if (hand.left === "correct" && hand.right === "correct") {
-        noteStates[stepIndex] = stepFailed ? "wrong" : "correct";
-        draw(
-          notation.scaleName,
-          [notation.treble, notation.bass],
-          steps.map((s) => s.fingering),
+        noteStates[stepIndex] = {
+          left: hand.left,
+          right: hand.right,
+        };
+        markPianoKeys(step, stepFailed ? "#ef4444" : "#22c55e");
+        const playedNotation = buildPlayedLayerNotation(notation.scaleName, steps.length);
+        renderStaffLayers(
+          notation,
+          steps,
           stepIndex,
-          noteStates[stepIndex],
+          stepFailed ? "wrong" : "correct",
           noteStates,
-          noteHints
+          noteHints,
+          playedNotation
         );
       }
     });
@@ -556,45 +1221,56 @@ const runUserAttempt = async (steps, notation, bpm) => {
 
   const stepMs = 60000 / bpm / 2;
   let stepOnsetMs = alignToGridMs(stepMs);
-  const noteStates = steps.map(() => "pending");
-  const noteHints = steps.map(() => "");
+  const noteStates = steps.map(() => ({ left: "pending", right: "pending" }));
+  const noteHints = steps.map(() => ({ left: "", right: "" }));
+  startPerformanceCapture(stepMs, steps.length);
 
-  for (let index = 0; index < steps.length; index++) {
-    const waitMs = stepOnsetMs - performance.now();
-    if (waitMs > 0) {
-      await wait(waitMs);
-    }
+  try {
+    for (let index = 0; index < steps.length; index++) {
+      state.currentStepCursor = index;
+      while (state.isPaused) {
+        await wait(80);
+      }
 
-    draw(
-      notation.scaleName,
-      [notation.treble, notation.bass],
-      steps.map((s) => s.fingering),
-      index,
-      "pending",
-      noteStates,
-      noteHints
-    );
-    markPianoKeys(steps[index]);
-    const stepStart = performance.now();
-    const result = await runSingleStep({
-      expected: notation.expected[index],
-      stepIndex: index,
-      notation,
-      steps,
-      bpm,
-      stepStart,
-      noteStates,
-      noteHints,
-    });
-    metrics.noteHits += result.noteHits;
-    metrics.noteTotal += result.noteTotal;
-    metrics.onsetHits += result.onsetHit;
-    metrics.pressureHits += result.pressureHit;
-    metrics.releaseHits += result.releaseHit;
-    if (!result.ok) {
-      metrics.mistakes += 1;
+      const waitMs = stepOnsetMs - performance.now();
+      if (waitMs > 0) {
+        await wait(waitMs);
+      }
+
+      renderPianoRoll(state.expectedRollSteps, index);
+      const playedNotation = buildPlayedLayerNotation(notation.scaleName, steps.length);
+      renderStaffLayers(notation, steps, index, "pending", noteStates, noteHints, playedNotation);
+      updateScoreAutoScroll(index, steps.length);
+      markPianoKeys(steps[index], "#3c6df0");
+      const stepStart = performance.now();
+      const result = await runSingleStep({
+        expected: notation.expected[index],
+        step: steps[index],
+        stepIndex: index,
+        notation,
+        steps,
+        bpm,
+        stepStart,
+        noteStates,
+        noteHints,
+        waitForBarStart: state.settings.practiceMode === "read" && index === 0,
+      });
+      metrics.noteHits += result.noteHits;
+      metrics.noteTotal += result.noteTotal;
+      metrics.onsetHits += result.onsetHit;
+      metrics.pressureHits += result.pressureHit;
+      metrics.releaseHits += result.releaseHit;
+      if (!result.ok) {
+        metrics.mistakes += 1;
+      }
+      stepOnsetMs = performance.now() + stepMs;
     }
-    stepOnsetMs = stepStart + stepMs;
+  } finally {
+    stopPerformanceCapture();
+    state.playedRollSequence = buildPlayedRollSequence(steps.length);
+    renderPianoRoll(state.expectedRollSteps, state.currentStepCursor);
+    const playedNotation = buildPlayedLayerNotation(notation.scaleName, steps.length);
+    renderStaffLayers(notation, steps, state.currentStepCursor, "pending", noteStates, noteHints, playedNotation);
   }
 
   const accuracy = metrics.noteTotal ? (metrics.noteHits / metrics.noteTotal) * 100 : 0;
@@ -617,6 +1293,17 @@ const runUserAttempt = async (steps, notation, bpm) => {
     mistakes: metrics.mistakes,
     noteHints,
   };
+};
+
+const updateScoreAutoScroll = (index, total) => {
+  const viewport = document.getElementById("scoreViewport");
+  const output = document.getElementById("outputExpected");
+  if (!viewport || !output || total <= 1) {
+    return;
+  }
+  const maxScroll = Math.max(0, output.scrollWidth - viewport.clientWidth);
+  const ratio = Math.min(1, Math.max(0, index / (total - 1)));
+  output.style.transform = `translateX(${-maxScroll * ratio}px)`;
 };
 
 const updateSpacedRepetition = (lessonId, summary) => {
@@ -743,6 +1430,17 @@ const runLesson = async (lesson) => {
   }
 
   const notation = prepareNotation(steps);
+  state.currentNotation = notation;
+  state.currentSteps = steps;
+  state.currentStepCursor = -1;
+  const rollSteps = steps.map((step, index) => ({
+    ...step,
+    rightMidi: notation.expected[index]?.rightMidi,
+    leftMidi: notation.expected[index]?.leftMidi,
+  }));
+  state.expectedRollSteps = rollSteps;
+  state.playedRollSequence = [];
+  renderPianoRoll(state.expectedRollSteps, -1);
   let done = false;
   let lastSummary = null;
   const targetTempoRatio = state.settings.tempoRatio;
@@ -821,10 +1519,19 @@ const nextLesson = async (noIncrement = false) => {
 const setActiveScreen = (screen) => {
   [state.refs.homeScreen, state.refs.practiceScreen, state.refs.statsScreen].forEach((s) => s.classList.remove("active"));
   screen.classList.add("active");
+
+  if (screen === state.refs.practiceScreen) {
+    document.body.classList.add("training-active");
+  } else {
+    document.body.classList.remove("training-active");
+  }
 };
 
 const renderMidiInputOptions = () => {
-  const select = state.refs.midiInputSelect;
+  const select = state.refs?.midiInputSelect;
+  if (!select) {
+    return;
+  }
   select.innerHTML = "";
   const keyboardOption = document.createElement("option");
   keyboardOption.value = virtualKeyboardInputId;
@@ -875,10 +1582,13 @@ const renderLessonPacks = () => {
 
 const applyShowPiano = () => {
   state.refs.pianoKeysContainer.style.display = state.settings.showPiano ? "flex" : "none";
+  state.refs.practiceScreen.classList.toggle("with-piano", !!state.settings.showPiano);
 };
 
 const syncSettingsToUI = () => {
   state.refs.practiceMode.value = state.settings.practiceMode;
+  state.refs.visualMode.value = state.settings.visualMode;
+  state.refs.playInputSoundToggle.checked = !!state.settings.playInputSound;
   state.refs.accuracyTarget.value = state.settings.accuracyTarget;
   state.refs.timingWindow.value = state.settings.timingWindow;
   state.refs.releaseWindow.value = state.settings.releaseWindow;
@@ -887,6 +1597,7 @@ const syncSettingsToUI = () => {
   state.refs.majmin.value = state.settings.selectedMode;
   state.refs.showPianoToggle.checked = state.settings.showPiano;
   applyShowPiano();
+  applyVisualMode();
 };
 
 const main = async () => {
@@ -903,6 +1614,9 @@ const main = async () => {
     practiceScreen: document.getElementById("practiceScreen"),
     statsScreen: document.getElementById("statsScreen"),
     backFromStats: document.getElementById("backFromStats"),
+    pauseOverlay: document.getElementById("pauseOverlay"),
+    resumeTrainingButton: document.getElementById("resumeTrainingButton"),
+    stopTrainingButton: document.getElementById("stopTrainingButton"),
     lessonMenuButton: document.getElementById("lessonMenuButton"),
     settingsButton: document.getElementById("settingsButton"),
     lessonMenu: document.getElementById("lessonMenu"),
@@ -914,10 +1628,12 @@ const main = async () => {
     currentPackLabel: document.getElementById("currentPackLabel"),
     lessonTitle: document.getElementById("lessonTitle"),
     practiceMode: document.getElementById("practiceMode"),
+    visualMode: document.getElementById("visualMode"),
     accuracyTarget: document.getElementById("accuracyTarget"),
     timingWindow: document.getElementById("timingWindow"),
     releaseWindow: document.getElementById("releaseWindow"),
     midiInputSelect: document.getElementById("midiInputSelect"),
+    playInputSoundToggle: document.getElementById("playInputSoundToggle"),
     allKeys: document.getElementById("allKeys"),
     majmin: document.getElementById("majmin"),
     showPianoToggle: document.getElementById("showPianoToggle"),
@@ -931,6 +1647,10 @@ const main = async () => {
     tempoRatio: document.getElementById("tempoRatio"),
     tempoRatioValue: document.getElementById("tempoRatioValue"),
     pianoKeysContainer: document.getElementById("pianoKeysContainer"),
+    scoreViewport: document.getElementById("scoreViewport"),
+    pianoRollViewport: document.getElementById("pianoRollViewport"),
+    pianoRollExpected: document.getElementById("pianoRollExpected"),
+    pianoRollPlayed: document.getElementById("pianoRollPlayed"),
   };
 
   allNotes.forEach((note) => {
@@ -950,6 +1670,9 @@ const main = async () => {
     state.refs.sheetBackdrop.classList.remove("hidden");
     state.refs.sheetBackdrop.classList.add("visible");
   };
+
+  const openMenuSheet = () => showSheet(state.refs.settingsPanel);
+  const openLessonsSheet = () => showSheet(state.refs.lessonMenu);
 
   const hideAllSheets = () => {
     [state.refs.lessonMenu, state.refs.settingsPanel].forEach((sheet) => {
@@ -980,14 +1703,20 @@ const main = async () => {
     await nextLesson();
   });
 
-  state.refs.lessonMenuButton.addEventListener("click", () => showSheet(state.refs.lessonMenu));
-  state.refs.settingsButton.addEventListener("click", () => showSheet(state.refs.settingsPanel));
+  state.refs.lessonMenuButton.addEventListener("click", () => openLessonsSheet());
+  state.refs.settingsButton.addEventListener("click", () => openMenuSheet());
   state.refs.closeLessonMenu.addEventListener("click", hideAllSheets);
   state.refs.closeSettings.addEventListener("click", hideAllSheets);
   state.refs.sheetBackdrop.addEventListener("click", hideAllSheets);
 
   state.refs.practiceMode.addEventListener("change", (event) => {
     state.settings.practiceMode = event.target.value;
+    saveSettings(state.settings);
+  });
+
+  state.refs.visualMode.addEventListener("change", (event) => {
+    state.settings.visualMode = event.target.value;
+    applyVisualMode();
     saveSettings(state.settings);
   });
 
@@ -1037,6 +1766,11 @@ const main = async () => {
     setActiveMidiInput(event.target.value);
   });
 
+  state.refs.playInputSoundToggle.addEventListener("change", (event) => {
+    state.settings.playInputSound = event.target.checked;
+    saveSettings(state.settings);
+  });
+
   state.refs.startMetronome.addEventListener("click", () => {
     state.metronomeEnabled = !state.metronomeEnabled;
     if (!state.metronomeEnabled) {
@@ -1062,6 +1796,55 @@ const main = async () => {
   state.refs.backFromStats.addEventListener("click", () => {
     setActiveScreen(state.isPracticeActive ? state.refs.practiceScreen : state.refs.homeScreen);
   });
+
+  state.refs.resumeTrainingButton.addEventListener("click", () => resumeTraining());
+  state.refs.stopTrainingButton.addEventListener("click", () => stopTraining());
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      togglePauseTraining();
+    }
+  });
+
+  state.refs.practiceScreen.addEventListener(
+    "touchstart",
+    (event) => {
+      const touch = event.changedTouches?.[0];
+      if (!touch) {
+        return;
+      }
+      state.swipeStartX = touch.clientX;
+      state.swipeStartY = touch.clientY;
+    },
+    { passive: true }
+  );
+
+  state.refs.practiceScreen.addEventListener(
+    "touchend",
+    (event) => {
+      const touch = event.changedTouches?.[0];
+      if (!touch || state.swipeStartX == null || state.swipeStartY == null || !state.isPracticeActive) {
+        return;
+      }
+
+      const dx = touch.clientX - state.swipeStartX;
+      const dy = touch.clientY - state.swipeStartY;
+      state.swipeStartX = null;
+      state.swipeStartY = null;
+
+      if (Math.abs(dx) < 70 || Math.abs(dx) < Math.abs(dy)) {
+        return;
+      }
+
+      if (dx > 0) {
+        openMenuSheet();
+      } else {
+        openLessonsSheet();
+      }
+    },
+    { passive: true }
+  );
 
   const piano = document.createElement("custom-piano-keys");
   piano.setAttribute("id", "pianoKeys");

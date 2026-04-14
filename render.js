@@ -2,10 +2,27 @@ const { Factory, EasyScore, System, Registry } = Vex.Flow;
 const VF = Vex.Flow;
 
 
-const draw = (scaleName, notes, fingerings, hl, currentStepState = "pending", noteStates = [], noteHints = [])=> {
+const draw = (
+  scaleName,
+  notes,
+  fingerings,
+  hl,
+  currentStepState = "pending",
+  noteStates = [],
+  noteHints = [],
+  options = {}
+)=> {
+
+    const elementId = options.elementId || "outputExpected";
+    const showFingerings = options.showFingerings !== false;
+    const showHints = options.showHints !== false;
 
     // console.log("Drawing scale:", scaleName, notes, fingerings, hl);
-    document.getElementById("output").innerHTML = ""
+    const host = document.getElementById(elementId);
+    if (!host) {
+      return;
+    }
+    host.innerHTML = ""
     const signture = "2/4"
 
     const registry = new Registry();
@@ -19,7 +36,7 @@ const draw = (scaleName, notes, fingerings, hl, currentStepState = "pending", no
     let initWidth = 350
 
     const vf = new Factory({
-    renderer: { elementId: 'output', width: 550, height: 300 },
+    renderer: { elementId, width: 550, height: 300 },
     });
 
     
@@ -39,8 +56,14 @@ const draw = (scaleName, notes, fingerings, hl, currentStepState = "pending", no
     score.set({ time: '2/4'});
     let system = vf.System({x,y,width:initWidth, spaceBetweenStaves: 10});
 
-    const trebleVoice = score.voice(score.beam(score.notes(notes[0], {stem: 'up'})));
-    const bassVoice = score.voice(score.beam(score.notes(notes[1], {stem: 'down', clef: 'bass'})));
+    const trebleNotes = score.notes(notes[0], { stem: 'up' });
+    const bassNotes = score.notes(notes[1], { stem: 'down', clef: 'bass' });
+
+    const canBeamTreble = Array.isArray(trebleNotes) && trebleNotes.length >= 2;
+    const canBeamBass = Array.isArray(bassNotes) && bassNotes.length >= 2;
+
+    const trebleVoice = score.voice(canBeamTreble ? score.beam(trebleNotes) : trebleNotes);
+    const bassVoice = score.voice(canBeamBass ? score.beam(bassNotes) : bassNotes);
 
     trebleVoice.setStrict(false);
     bassVoice.setStrict(false);
@@ -65,24 +88,42 @@ const draw = (scaleName, notes, fingerings, hl, currentStepState = "pending", no
         console.error(`Note ID or Bass ID is undefined for index ${noteId}`);
         return;
     }
-    id(noteId).addModifier(0, vf.Fingering({ number: fingering, position: 'above' }));
-    id(bassId).addModifier(0, vf.Fingering({ number: 6-fingering, position: 'below' }));
-
-    const hintText = noteHints[i];
-    if (hintText) {
-      const annotation = new VF.Annotation(hintText)
-        .setVerticalJustification(VF.Annotation.VerticalJustify.TOP)
-        .setFont("Arial", 12, "normal");
-      id(noteId).addModifier(0, annotation);
+    if (showFingerings) {
+      id(noteId).addModifier(0, vf.Fingering({ number: fingering, position: 'above' }));
+      id(bassId).addModifier(0, vf.Fingering({ number: 6-fingering, position: 'below' }));
     }
 
-    const state = noteStates[i];
-    if (state === "correct") {
+    const hintData = noteHints[i];
+    const hintTop = typeof hintData === "string" ? hintData : hintData?.right;
+    const hintBottom = typeof hintData === "object" ? hintData?.left : "";
+
+    if (showHints && hintTop) {
+      const annotationTop = new VF.Annotation(hintTop)
+        .setVerticalJustification(VF.Annotation.VerticalJustify.TOP)
+        .setFont("Arial", 11, "normal");
+      id(noteId).addModifier(0, annotationTop);
+    }
+    if (showHints && hintBottom) {
+      const annotationBottom = new VF.Annotation(hintBottom)
+        .setVerticalJustification(VF.Annotation.VerticalJustify.BOTTOM)
+        .setFont("Arial", 11, "normal");
+      id(bassId).addModifier(0, annotationBottom);
+    }
+
+    const stateData = noteStates[i];
+    const stateRight = typeof stateData === "string" ? stateData : stateData?.right;
+    const stateLeft = typeof stateData === "string" ? stateData : stateData?.left;
+
+    if (stateRight === "correct") {
       id(noteId).setStyle({ fillStyle: "green", strokeStyle: "green" });
+    }
+    if (stateRight === "wrong" || stateRight === "missed") {
+      id(noteId).setStyle({ fillStyle: "red", strokeStyle: "red" });
+    }
+    if (stateLeft === "correct") {
       id(bassId).setStyle({ fillStyle: "green", strokeStyle: "green" });
     }
-    if (state === "wrong") {
-      id(noteId).setStyle({ fillStyle: "red", strokeStyle: "red" });
+    if (stateLeft === "wrong" || stateLeft === "missed") {
       id(bassId).setStyle({ fillStyle: "red", strokeStyle: "red" });
     }
   })
