@@ -28,6 +28,7 @@ const keyboardTestMap = {
 const defaultSettings = {
   practiceMode: "read",
   visualMode: "notes",
+  metronomeEnabled: true,
   playInputSound: true,
   accuracyTarget: 90,
   timingWindow: 120,
@@ -76,6 +77,12 @@ const state = {
   currentStepCursor: -1,
   currentNotation: null,
   currentSteps: [],
+  rollCursorRafId: null,
+  rollCursorOriginMs: 0,
+  rollCursorStepMs: 0,
+  rollCursorTotalSteps: 0,
+  rollCursorActive: false,
+  rollCursorValue: 0,
   performanceCapture: {
     active: false,
     startMs: 0,
@@ -524,10 +531,10 @@ const scheduleClick = (ctx, atTimeSec, accent) => {
     const now = performance.now();
     const delayMs = Math.max(0, (atTimeSec - ctx.currentTime) * 1000);
     const when = now + delayMs;
-    const drumNote = accent ? 37 : 42;
-    const velocity = accent ? 112 : 82;
+    const drumNote = accent ? 76 : 77;
+    const velocity = accent ? 72 : 48;
     const onSent = safeSendMidi(output, [0x99, drumNote, velocity], when);
-    const offSent = safeSendMidi(output, [0x89, drumNote, 0], when + 55);
+    const offSent = safeSendMidi(output, [0x89, drumNote, 0], when + 35);
     if (onSent && offSent) {
       return;
     }
@@ -541,7 +548,7 @@ const scheduleClick = (ctx, atTimeSec, accent) => {
   filter.Q.setValueAtTime(7, atTimeSec);
   const gain = ctx.createGain();
   gain.gain.setValueAtTime(0.0001, atTimeSec);
-  gain.gain.exponentialRampToValueAtTime(accent ? 0.12 : 0.07, atTimeSec + 0.004);
+  gain.gain.exponentialRampToValueAtTime(accent ? 0.08 : 0.05, atTimeSec + 0.004);
   gain.gain.exponentialRampToValueAtTime(0.0001, atTimeSec + 0.055);
   noise.connect(filter);
   filter.connect(gain);
@@ -561,16 +568,53 @@ const midiToLabel = (midiNumber) => {
   return `${names[midiNumber % 12]}${octave} (${midiNumber})`;
 };
 
-const startPerformanceCapture = (stepMs, totalSteps) => {
+const startPerformanceCapture = (stepMs, totalSteps, originMs = performance.now()) => {
   state.performanceCapture = {
     active: true,
-    startMs: performance.now(),
+    startMs: originMs,
     endMs: 0,
     stepMs,
     totalSteps,
     notes: [],
     activeNotes: new Map(),
   };
+};
+
+const getSafeEventTimeMs = (receivedTime) => {
+  const now = performance.now();
+  if (typeof receivedTime !== "number") {
+    return now;
+  }
+  return Math.abs(receivedTime - now) <= 5000 ? receivedTime : now;
+};
+
+const stopContinuousRollCursor = () => {
+  if (state.rollCursorRafId) {
+    cancelAnimationFrame(state.rollCursorRafId);
+  }
+  state.rollCursorRafId = null;
+  state.rollCursorActive = false;
+};
+
+const startContinuousRollCursor = (originMs, stepMs, totalSteps) => {
+  stopContinuousRollCursor();
+  state.rollCursorOriginMs = originMs;
+  state.rollCursorStepMs = Math.max(1, stepMs);
+  state.rollCursorTotalSteps = Math.max(1, totalSteps);
+  state.rollCursorActive = true;
+
+  const tick = () => {
+    if (!state.rollCursorActive) {
+      return;
+    }
+    const now = performance.now();
+    const cursor = (now - state.rollCursorOriginMs) / state.rollCursorStepMs;
+    state.rollCursorValue = Math.max(0, Math.min(state.rollCursorTotalSteps, cursor));
+    renderPianoRoll(state.expectedRollSteps, state.rollCursorValue);
+    state.rollCursorRafId = requestAnimationFrame(tick);
+  };
+
+  tick();
 };
 
 const stopPerformanceCapture = () => {
@@ -716,13 +760,18 @@ const capturePerformedInput = (message) => {
   }
 
   const isNoteOn = status === 9 && velocityRaw > 0;
-  const nowRelative = performance.now() - capture.startMs;
+  const eventTimeMs = getSafeEventTimeMs(message?.receivedTime);
+  const nowRelative = eventTimeMs - capture.startMs;
   const keyboardHand = message?.keyboardMeta?.hand || null;
+
+  if (nowRelative < -8) {
+    return;
+  }
 
   if (isNoteOn) {
     if (!capture.activeNotes.has(note)) {
       capture.activeNotes.set(note, {
-        startMs: Math.max(0, nowRelative),
+        startMs: nowRelative,
         handHint: keyboardHand,
       });
     }
@@ -752,7 +801,8 @@ const capturePerformedInput = (message) => {
       [],
       playedNotation
     );
-    renderPianoRoll(state.expectedRollSteps, state.currentStepCursor);
+    const cursor = state.rollCursorActive ? state.rollCursorValue : state.currentStepCursor;
+    renderPianoRoll(state.expectedRollSteps, cursor);
   }
 };
 
@@ -824,16 +874,29 @@ const stopTransport = () => {
   state.transport.schedulerId = null;
 };
 
-const startTransport = (bpm, beatsPerBar = 2) => {
+const startTransport = (bpm, beatsPerBar = 2, options = {}) => {
   const ctx = getAudioContext();
+  const normalizedBpm = Number(bpm) || 60;
+  const normalizedBeatsPerBar = Math.max(1, Number(beatsPerBar) || 2);
+  const forceDownbeat = !!options.forceDownbeat;
+
+  if (
+    state.transport.running &&
+    !forceDownbeat &&
+    Math.abs(state.transport.bpm - normalizedBpm) < 0.01 &&
+    state.transport.beatsPerBar === normalizedBeatsPerBar
+  ) {
+    return;
+  }
+
   stopTransport();
 
-  const beatDurationSec = 60 / bpm;
-  const startLeadSec = 0.08;
+  const beatDurationSec = 60 / normalizedBpm;
+  const startLeadSec = forceDownbeat ? 0.16 : 0.08;
 
   state.transport.running = true;
-  state.transport.bpm = bpm;
-  state.transport.beatsPerBar = Math.max(1, Number(beatsPerBar) || 2);
+  state.transport.bpm = normalizedBpm;
+  state.transport.beatsPerBar = normalizedBeatsPerBar;
   state.transport.beatDurationSec = beatDurationSec;
   state.transport.nextBeatAudioTime = ctx.currentTime + startLeadSec;
   state.transport.beatIndex = 0;
@@ -866,13 +929,15 @@ const startTransport = (bpm, beatsPerBar = 2) => {
   }, lookAheadMs);
 };
 
-const alignToGridMs = (stepMs) => {
+const alignToGridMs = (stepMs, futureOnly = false) => {
   const now = performance.now();
   if (!state.transport.running || !stepMs) {
     return now;
   }
   const elapsed = now - state.transport.startPerfMs;
-  const stepsFromStart = Math.ceil(elapsed / stepMs);
+  const stepsFromStart = futureOnly
+    ? Math.floor(elapsed / stepMs) + 1
+    : Math.round(elapsed / stepMs);
   return state.transport.startPerfMs + Math.max(0, stepsFromStart) * stepMs;
 };
 
@@ -1059,7 +1124,8 @@ const markPianoKeys = (step, color = "#3c6df0") => {
 const playDemo = async (steps, notation, bpm) => {
   const ctx = getAudioContext();
   const stepMs = 60000 / bpm / 2;
-  let onsetMs = alignToGridMs(stepMs);
+  let onsetMs = alignToGridMs(stepMs, true);
+  let lastReleaseMs = onsetMs;
 
   for (let index = 0; index < steps.length; index++) {
     const waitMs = onsetMs - performance.now();
@@ -1075,7 +1141,13 @@ const playDemo = async (steps, notation, bpm) => {
     const durationSec = Math.max(0.12, (stepMs / 1000) * 0.85);
     schedulePianoNote(ctx, notation.expected[index]?.leftMidi, atTimeSec, durationSec, 0.55);
     schedulePianoNote(ctx, notation.expected[index]?.rightMidi, atTimeSec, durationSec, 0.6);
+    lastReleaseMs = onsetMs + durationSec * 1000;
     onsetMs += stepMs;
+  }
+
+  const tailWaitMs = Math.max(0, lastReleaseMs - performance.now() + 40);
+  if (tailWaitMs > 0) {
+    await wait(tailWaitMs);
   }
 };
 
@@ -1327,7 +1399,7 @@ const runSingleStep = ({
         return;
       }
 
-      const eventTime = typeof receivedTime === "number" ? receivedTime : performance.now();
+      const eventTime = getSafeEventTimeMs(receivedTime);
       if (eventTime < effectiveStepStart - 5) {
         return;
       }
@@ -1456,10 +1528,14 @@ const runUserAttempt = async (steps, notation, bpm) => {
   };
 
   const stepMs = 60000 / bpm / 2;
-  let stepOnsetMs = alignToGridMs(stepMs);
+  let stepOnsetMs =
+    state.settings.practiceMode === "imitation"
+      ? alignToGridMs(stepMs, true)
+      : alignToGridMs(stepMs);
   const noteStates = steps.map(() => ({ left: "pending", right: "pending" }));
   const noteHints = steps.map(() => ({ left: "", right: "" }));
-  startPerformanceCapture(stepMs, steps.length);
+  startPerformanceCapture(stepMs, steps.length, stepOnsetMs);
+  startContinuousRollCursor(stepOnsetMs, stepMs, steps.length);
 
   try {
     for (let index = 0; index < steps.length; index++) {
@@ -1473,7 +1549,7 @@ const runUserAttempt = async (steps, notation, bpm) => {
         await wait(waitMs);
       }
 
-      renderPianoRoll(state.expectedRollSteps, index);
+      renderPianoRoll(state.expectedRollSteps, state.rollCursorValue || index);
       const playedNotation = buildPlayedLayerNotation(notation.scaleName, steps.length);
       renderStaffLayers(notation, steps, index, "pending", noteStates, noteHints, playedNotation);
       updateScoreAutoScroll(index, steps.length);
@@ -1490,7 +1566,10 @@ const runUserAttempt = async (steps, notation, bpm) => {
         expectedOnsetMs: stepOnsetMs,
         noteStates,
         noteHints,
-        waitForBarStart: state.settings.practiceMode === "read" && index === 0,
+        waitForBarStart:
+          state.settings.practiceMode === "read" &&
+          index === 0 &&
+          currentMidiInputId === virtualKeyboardInputId,
       });
       metrics.noteHits += result.noteHits;
       metrics.noteTotal += result.noteTotal;
@@ -1503,6 +1582,7 @@ const runUserAttempt = async (steps, notation, bpm) => {
       stepOnsetMs += stepMs;
     }
   } finally {
+    stopContinuousRollCursor();
     stopPerformanceCapture();
     state.playedRollSequence = buildPlayedRollSequence(steps.length);
     renderPianoRoll(state.expectedRollSteps, state.currentStepCursor);
@@ -1733,7 +1813,12 @@ const runLesson = async (lesson) => {
       const reasonText = reasons.length ? reasons.join(", ") : "step hints";
       updatePracticeFeedback(`Will repeat next bar. Issue: ${reasonText}${hintPreview ? ` (${hintPreview})` : ""}`, "bad");
       if (summary.mistakes >= 1) {
+        const previousRatio = state.dynamicTempoRatio;
         state.dynamicTempoRatio = Math.max(0.25, state.dynamicTempoRatio * 0.85);
+        if (Math.abs(previousRatio - state.dynamicTempoRatio) > 0.0001) {
+          const nextBpm = Math.max(20, baseTempo * state.dynamicTempoRatio);
+          startTransport(nextBpm, beatsPerBar, { forceDownbeat: true });
+        }
       }
       await wait(200);
     }
@@ -1826,6 +1911,7 @@ const applyShowPiano = () => {
 const syncSettingsToUI = () => {
   state.refs.practiceMode.value = state.settings.practiceMode;
   state.refs.visualMode.value = state.settings.visualMode;
+  state.refs.metronomeEnabledToggle.checked = !!state.settings.metronomeEnabled;
   state.refs.playInputSoundToggle.checked = !!state.settings.playInputSound;
   state.refs.accuracyTarget.value = state.settings.accuracyTarget;
   state.refs.timingWindow.value = state.settings.timingWindow;
@@ -1871,6 +1957,7 @@ const main = async () => {
   setupComputerKeyboardInput();
 
   state.settings = loadSettings();
+  state.metronomeEnabled = !!state.settings.metronomeEnabled;
   state.currentPackId = readFromStorage("pack-id") || state.currentPackId;
 
   state.refs = {
@@ -1904,8 +1991,8 @@ const main = async () => {
     allKeys: document.getElementById("allKeys"),
     majmin: document.getElementById("majmin"),
     showPianoToggle: document.getElementById("showPianoToggle"),
+    metronomeEnabledToggle: document.getElementById("metronomeEnabledToggle"),
     nextButton: document.getElementById("nextButton"),
-    startMetronome: document.getElementById("startMetronome"),
     showStatsButton: document.getElementById("showStatsButton"),
     showLogsButton: document.getElementById("showLogsButton"),
     refreshLogsButton: document.getElementById("refreshLogsButton"),
@@ -2037,6 +2124,19 @@ const main = async () => {
     saveSettings(state.settings);
   });
 
+  state.refs.metronomeEnabledToggle.addEventListener("change", (event) => {
+    state.settings.metronomeEnabled = !!event.target.checked;
+    state.metronomeEnabled = !!event.target.checked;
+    saveSettings(state.settings);
+
+    if (state.metronomeEnabled && state.transport.running) {
+      const baseTempo = state.activeLesson?.baseTempo || state.activeLesson?.tempo || 60;
+      const bpm = baseTempo * (state.dynamicTempoRatio || state.settings.tempoRatio || 1);
+      const beatsPerBar = getLessonBeatsPerBar(state.activeLesson);
+      startTransport(bpm, beatsPerBar, { forceDownbeat: true });
+    }
+  });
+
   state.refs.midiInputSelect.addEventListener("change", (event) => {
     setActiveMidiInput(event.target.value);
   });
@@ -2044,23 +2144,6 @@ const main = async () => {
   state.refs.playInputSoundToggle.addEventListener("change", (event) => {
     state.settings.playInputSound = event.target.checked;
     saveSettings(state.settings);
-  });
-
-  state.refs.startMetronome.addEventListener("click", () => {
-    state.metronomeEnabled = !state.metronomeEnabled;
-    if (!state.metronomeEnabled) {
-      state.refs.startMetronome.textContent = "Start Metronome";
-      return;
-    }
-
-    if (!state.transport.running) {
-      const baseTempo = state.activeLesson?.baseTempo || state.activeLesson?.tempo || 60;
-      const bpm = baseTempo * (state.dynamicTempoRatio || state.settings.tempoRatio || 1);
-      const beatsPerBar = getLessonBeatsPerBar(state.activeLesson);
-      startTransport(bpm, beatsPerBar);
-    }
-
-    state.refs.startMetronome.textContent = "Stop Metronome";
   });
 
   state.refs.showStatsButton.addEventListener("click", () => {
@@ -2169,7 +2252,6 @@ const main = async () => {
   const initialTempo = 60;
   ensureWakeLockListener();
   updateTempoLabel(initialTempo, state.settings.tempoRatio || 1);
-  startTransport(initialTempo);
 };
 
 document.addEventListener("DOMContentLoaded", main);
