@@ -56,6 +56,9 @@ const state = {
     schedulerId: null,
   },
   audioContext: null,
+  wakeLock: null,
+  wakeLockListenerAttached: false,
+  activeMidiOutputId: null,
   midiPollId: null,
   isPaused: false,
   lastPauseStartedAt: 0,
@@ -143,6 +146,53 @@ const saveSettings = (settings) => writeToStorage(settingsStorageKey, settings);
 const loadSrState = () => readFromStorage(srStorageKey) || { lessons: {} };
 const saveSrState = (sr) => writeToStorage(srStorageKey, sr);
 
+const releaseWakeLock = async () => {
+  if (!state.wakeLock) {
+    return;
+  }
+  try {
+    await state.wakeLock.release();
+  } catch (error) {
+    console.warn("Wake lock release failed", error);
+  }
+  state.wakeLock = null;
+};
+
+const requestWakeLock = async () => {
+  if (!state.isPracticeActive || !navigator.wakeLock?.request) {
+    return;
+  }
+  if (document.visibilityState !== "visible") {
+    return;
+  }
+  if (state.wakeLock) {
+    return;
+  }
+
+  try {
+    state.wakeLock = await navigator.wakeLock.request("screen");
+    state.wakeLock.addEventListener("release", () => {
+      state.wakeLock = null;
+    });
+  } catch (error) {
+    console.warn("Wake lock request failed", error);
+  }
+};
+
+const ensureWakeLockListener = () => {
+  if (state.wakeLockListenerAttached) {
+    return;
+  }
+  document.addEventListener("visibilitychange", async () => {
+    if (document.visibilityState === "visible" && state.isPracticeActive) {
+      await requestWakeLock();
+    } else if (document.visibilityState !== "visible") {
+      await releaseWakeLock();
+    }
+  });
+  state.wakeLockListenerAttached = true;
+};
+
 const setMidiHandler = (handler) => {
   currentMidiHandler = handler;
 };
@@ -194,6 +244,7 @@ const stopTraining = () => {
   hidePauseOverlay();
   setMidiHandler(null);
   setActiveScreen(state.refs.homeScreen);
+  releaseWakeLock();
 };
 
 const togglePauseTraining = () => {
@@ -273,6 +324,49 @@ const getConnectedMidiInputIds = () => {
   return Array.from(midiAccessRef.inputs.values()).map((input) => input.id);
 };
 
+const findBestMidiOutputForInput = () => {
+  if (!midiAccessRef || !currentMidiInputId || currentMidiInputId === virtualKeyboardInputId) {
+    return null;
+  }
+
+  const outputs = Array.from(midiAccessRef.outputs.values());
+  if (!outputs.length) {
+    return null;
+  }
+
+  const selectedInput = midiAccessRef.inputs.get(currentMidiInputId);
+  const normalizedInputName = (selectedInput?.name || "").trim().toLowerCase();
+
+  if (normalizedInputName) {
+    const exact = outputs.find((output) => (output.name || "").trim().toLowerCase() === normalizedInputName);
+    if (exact) {
+      return exact;
+    }
+
+    const partial = outputs.find((output) => {
+      const name = (output.name || "").trim().toLowerCase();
+      return name && (name.includes(normalizedInputName) || normalizedInputName.includes(name));
+    });
+    if (partial) {
+      return partial;
+    }
+  }
+
+  return outputs[0] || null;
+};
+
+const syncActiveMidiOutput = () => {
+  const output = findBestMidiOutputForInput();
+  state.activeMidiOutputId = output?.id || null;
+};
+
+const getActiveMidiOutput = () => {
+  if (!midiAccessRef || !state.activeMidiOutputId) {
+    return null;
+  }
+  return midiAccessRef.outputs.get(state.activeMidiOutputId) || null;
+};
+
 const refreshMidiSelection = () => {
   const ids = getConnectedMidiInputIds();
   const hasSelected = currentMidiInputId && ids.includes(currentMidiInputId);
@@ -280,12 +374,14 @@ const refreshMidiSelection = () => {
     currentMidiInputId = ids[0] || virtualKeyboardInputId;
     writeToStorage("midi-input-id", currentMidiInputId);
   }
+  syncActiveMidiOutput();
 };
 
 const setActiveMidiInput = (inputId) => {
   currentMidiInputId = inputId;
   writeToStorage("midi-input-id", inputId);
   attachAllMidiListeners();
+  syncActiveMidiOutput();
   if (state.refs?.midiInputSelect) {
     state.refs.midiInputSelect.value = inputId;
   }
@@ -301,6 +397,7 @@ const setupMidiAccess = async () => {
   const fallbackInput = firstInput ? firstInput.id : virtualKeyboardInputId;
   const selected = storedInput && midiAccessRef.inputs.has(storedInput) ? storedInput : fallbackInput;
   setActiveMidiInput(selected);
+  syncActiveMidiOutput();
 
   midiAccessRef.onstatechange = () => {
     refreshMidiSelection();
@@ -361,6 +458,18 @@ const getAudioContext = () => {
 };
 
 const scheduleClick = (ctx, atTimeSec, accent) => {
+  const output = getActiveMidiOutput();
+  if (output) {
+    const now = performance.now();
+    const delayMs = Math.max(0, (atTimeSec - ctx.currentTime) * 1000);
+    const when = now + delayMs;
+    const note = accent ? 84 : 72;
+    const velocity = accent ? 110 : 70;
+    output.send([0x90, note, velocity], when);
+    output.send([0x80, note, 0], when + 80);
+    return;
+  }
+
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
   osc.type = "triangle";
@@ -592,6 +701,18 @@ const schedulePianoNote = (ctx, midiNumber, atTimeSec, durationSec = 0.22, veloc
   if (midiNumber == null) {
     return;
   }
+
+  const output = getActiveMidiOutput();
+  if (output) {
+    const now = performance.now();
+    const delayMs = Math.max(0, (atTimeSec - ctx.currentTime) * 1000);
+    const when = now + delayMs;
+    const velocityInt = Math.max(1, Math.min(127, Math.round(velocity * 127)));
+    output.send([0x90, midiNumber, velocityInt], when);
+    output.send([0x80, midiNumber, 0], when + Math.max(60, durationSec * 1000));
+    return;
+  }
+
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
 
@@ -1767,6 +1888,7 @@ const main = async () => {
 
   state.refs.startButton.addEventListener("click", async () => {
     state.isPracticeActive = true;
+    await requestWakeLock();
     setActiveScreen(state.refs.practiceScreen);
     await nextLesson(true);
   });
@@ -1935,7 +2057,15 @@ const main = async () => {
       state.swipeStartX = null;
       state.swipeStartY = null;
 
-      if (Math.abs(dx) < 70 || Math.abs(dx) < Math.abs(dy)) {
+      const targetEl = event.target;
+      if (targetEl?.closest?.("button, input, select, option, label")) {
+        return;
+      }
+
+      const isHorizontalSwipe = Math.abs(dx) >= 70 && Math.abs(dx) > Math.abs(dy);
+
+      if (!isHorizontalSwipe) {
+        togglePauseTraining();
         return;
       }
 
@@ -1956,6 +2086,7 @@ const main = async () => {
   applyShowPiano();
 
   const initialTempo = 60;
+  ensureWakeLockListener();
   updateTempoLabel(initialTempo, state.settings.tempoRatio || 1);
   startTransport(initialTempo);
 };
