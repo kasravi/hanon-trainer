@@ -49,6 +49,7 @@ const state = {
   transport: {
     running: false,
     bpm: 60,
+    beatsPerBar: 2,
     beatDurationSec: 1,
     startPerfMs: 0,
     nextBeatAudioTime: 0,
@@ -59,6 +60,8 @@ const state = {
   wakeLock: null,
   wakeLockListenerAttached: false,
   activeMidiOutputId: null,
+  midiTopologySignature: "",
+  metronomeNoiseBuffer: null,
   midiPollId: null,
   isPaused: false,
   lastPauseStartedAt: 0,
@@ -98,6 +101,7 @@ const normalizeMidiMessage = (message, forcedInputId = null) => {
     data: [rawData[0], rawData[1] ?? 0, rawData[2] ?? 0],
     keyboardMeta: message?.keyboardMeta || null,
     inputId: forcedInputId ?? message?.inputId ?? null,
+    receivedTime: typeof message?.receivedTime === "number" ? message.receivedTime : null,
   };
 };
 
@@ -113,6 +117,7 @@ function parseMidiMessage(message) {
     velocity: normalized.data[2] / 127,
     keyboardMeta: normalized.keyboardMeta,
     inputId: normalized.inputId,
+    receivedTime: normalized.receivedTime,
   };
 }
 
@@ -317,6 +322,32 @@ const attachAllMidiListeners = () => {
   });
 };
 
+const buildMidiTopologySignature = () => {
+  if (!midiAccessRef) {
+    return "";
+  }
+  const inputs = Array.from(midiAccessRef.inputs.values())
+    .map((input) => `${input.id}:${input.state}:${input.connection}`)
+    .sort()
+    .join("|");
+  const outputs = Array.from(midiAccessRef.outputs.values())
+    .map((output) => `${output.id}:${output.state}:${output.connection}`)
+    .sort()
+    .join("|");
+  return `${inputs}__${outputs}`;
+};
+
+const refreshMidiTopology = () => {
+  const signature = buildMidiTopologySignature();
+  if (signature === state.midiTopologySignature) {
+    return;
+  }
+  state.midiTopologySignature = signature;
+  refreshMidiSelection();
+  attachAllMidiListeners();
+  renderMidiInputOptions();
+};
+
 const getConnectedMidiInputIds = () => {
   if (!midiAccessRef) {
     return [];
@@ -367,6 +398,24 @@ const getActiveMidiOutput = () => {
   return midiAccessRef.outputs.get(state.activeMidiOutputId) || null;
 };
 
+const safeSendMidi = (output, bytes, atMs) => {
+  if (!output) {
+    return false;
+  }
+  try {
+    if (typeof atMs === "number") {
+      output.send(bytes, atMs);
+    } else {
+      output.send(bytes);
+    }
+    return true;
+  } catch (error) {
+    console.warn("MIDI output send failed", error);
+    state.activeMidiOutputId = null;
+    return false;
+  }
+};
+
 const refreshMidiSelection = () => {
   const ids = getConnectedMidiInputIds();
   const hasSelected = currentMidiInputId && ids.includes(currentMidiInputId);
@@ -398,21 +447,18 @@ const setupMidiAccess = async () => {
   const selected = storedInput && midiAccessRef.inputs.has(storedInput) ? storedInput : fallbackInput;
   setActiveMidiInput(selected);
   syncActiveMidiOutput();
+  state.midiTopologySignature = buildMidiTopologySignature();
 
   midiAccessRef.onstatechange = () => {
-    refreshMidiSelection();
-    attachAllMidiListeners();
-    renderMidiInputOptions();
+    refreshMidiTopology();
   };
 
   if (state.midiPollId) {
     clearInterval(state.midiPollId);
   }
   state.midiPollId = setInterval(() => {
-    refreshMidiSelection();
-    attachAllMidiListeners();
-    renderMidiInputOptions();
-  }, 1000);
+    refreshMidiTopology();
+  }, 2500);
 };
 
 const setupComputerKeyboardInput = () => {
@@ -457,30 +503,51 @@ const getAudioContext = () => {
   return state.audioContext;
 };
 
+const getMetronomeNoiseBuffer = (ctx) => {
+  if (state.metronomeNoiseBuffer && state.metronomeNoiseBuffer.sampleRate === ctx.sampleRate) {
+    return state.metronomeNoiseBuffer;
+  }
+  const durationSec = 0.09;
+  const frameCount = Math.floor(ctx.sampleRate * durationSec);
+  const buffer = ctx.createBuffer(1, frameCount, ctx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let index = 0; index < frameCount; index++) {
+    data[index] = Math.random() * 2 - 1;
+  }
+  state.metronomeNoiseBuffer = buffer;
+  return buffer;
+};
+
 const scheduleClick = (ctx, atTimeSec, accent) => {
   const output = getActiveMidiOutput();
   if (output) {
     const now = performance.now();
     const delayMs = Math.max(0, (atTimeSec - ctx.currentTime) * 1000);
     const when = now + delayMs;
-    const note = accent ? 84 : 72;
-    const velocity = accent ? 110 : 70;
-    output.send([0x90, note, velocity], when);
-    output.send([0x80, note, 0], when + 80);
-    return;
+    const drumNote = accent ? 37 : 42;
+    const velocity = accent ? 112 : 82;
+    const onSent = safeSendMidi(output, [0x99, drumNote, velocity], when);
+    const offSent = safeSendMidi(output, [0x89, drumNote, 0], when + 55);
+    if (onSent && offSent) {
+      return;
+    }
   }
 
-  const osc = ctx.createOscillator();
+  const noise = ctx.createBufferSource();
+  noise.buffer = getMetronomeNoiseBuffer(ctx);
+  const filter = ctx.createBiquadFilter();
+  filter.type = "bandpass";
+  filter.frequency.setValueAtTime(accent ? 2600 : 1700, atTimeSec);
+  filter.Q.setValueAtTime(7, atTimeSec);
   const gain = ctx.createGain();
-  osc.type = "triangle";
-  osc.frequency.value = accent ? 880 : 660;
   gain.gain.setValueAtTime(0.0001, atTimeSec);
-  gain.gain.exponentialRampToValueAtTime(0.08, atTimeSec + 0.008);
-  gain.gain.exponentialRampToValueAtTime(0.0001, atTimeSec + 0.07);
-  osc.connect(gain);
+  gain.gain.exponentialRampToValueAtTime(accent ? 0.12 : 0.07, atTimeSec + 0.004);
+  gain.gain.exponentialRampToValueAtTime(0.0001, atTimeSec + 0.055);
+  noise.connect(filter);
+  filter.connect(gain);
   gain.connect(ctx.destination);
-  osc.start(atTimeSec);
-  osc.stop(atTimeSec + 0.08);
+  noise.start(atTimeSec);
+  noise.stop(atTimeSec + 0.06);
 };
 
 const midiToFrequency = (midiNumber) => 440 * Math.pow(2, (midiNumber - 69) / 12);
@@ -708,9 +775,11 @@ const schedulePianoNote = (ctx, midiNumber, atTimeSec, durationSec = 0.22, veloc
     const delayMs = Math.max(0, (atTimeSec - ctx.currentTime) * 1000);
     const when = now + delayMs;
     const velocityInt = Math.max(1, Math.min(127, Math.round(velocity * 127)));
-    output.send([0x90, midiNumber, velocityInt], when);
-    output.send([0x80, midiNumber, 0], when + Math.max(60, durationSec * 1000));
-    return;
+    const onSent = safeSendMidi(output, [0x90, midiNumber, velocityInt], when);
+    const offSent = safeSendMidi(output, [0x80, midiNumber, 0], when + Math.max(60, durationSec * 1000));
+    if (onSent && offSent) {
+      return;
+    }
   }
 
   const osc = ctx.createOscillator();
@@ -755,7 +824,7 @@ const stopTransport = () => {
   state.transport.schedulerId = null;
 };
 
-const startTransport = (bpm) => {
+const startTransport = (bpm, beatsPerBar = 2) => {
   const ctx = getAudioContext();
   stopTransport();
 
@@ -764,6 +833,7 @@ const startTransport = (bpm) => {
 
   state.transport.running = true;
   state.transport.bpm = bpm;
+  state.transport.beatsPerBar = Math.max(1, Number(beatsPerBar) || 2);
   state.transport.beatDurationSec = beatDurationSec;
   state.transport.nextBeatAudioTime = ctx.currentTime + startLeadSec;
   state.transport.beatIndex = 0;
@@ -780,7 +850,7 @@ const startTransport = (bpm) => {
       const beatPerfMs = state.transport.startPerfMs + beatIndex * beatDurationSec * 1000;
 
       if (state.metronomeEnabled) {
-        scheduleClick(ctx, beatAudioTime, beatIndex % 4 === 0);
+        scheduleClick(ctx, beatAudioTime, beatIndex % state.transport.beatsPerBar === 0);
       }
 
       const visualDelay = Math.max(0, beatPerfMs - performance.now());
@@ -851,6 +921,13 @@ const prepareNotation = (steps) => {
     leftMidi: noteNameWithOctaveToMidi(getNoteName(step.leftDegree + 1, scale, scaleName), 3),
   }));
   return { scaleName, treble, bass, expected };
+};
+
+const getLessonBeatsPerBar = (lesson) => {
+  const signature = `${lesson?.timeSignature || "2/4"}`;
+  const [numeratorRaw] = signature.split("/");
+  const numerator = Number(numeratorRaw);
+  return Number.isFinite(numerator) && numerator > 0 ? numerator : 2;
 };
 
 const updatePracticeFeedback = (text, tone = "neutral") => {
@@ -1049,6 +1126,7 @@ const runSingleStep = ({
   steps,
   bpm,
   stepStart,
+  expectedOnsetMs = null,
   noteStates,
   noteHints,
   waitForBarStart = false,
@@ -1065,7 +1143,7 @@ const runSingleStep = ({
     const handReleaseDelta = { left: null, right: null };
     let stepFailed = false;
 
-    let effectiveStepStart = stepStart;
+    let effectiveStepStart = typeof expectedOnsetMs === "number" ? expectedOnsetMs : stepStart;
     let timeout = null;
     let pauseAnchor = null;
     const receivedEvents = [];
@@ -1244,19 +1322,19 @@ const runSingleStep = ({
       if (!parsed) {
         return;
       }
-      const { command, note, velocity, keyboardMeta } = parsed;
+      const { command, note, velocity, keyboardMeta, receivedTime } = parsed;
       if (command !== 8 && command !== 9) {
         return;
       }
 
-      const eventTime = performance.now();
+      const eventTime = typeof receivedTime === "number" ? receivedTime : performance.now();
       if (eventTime < effectiveStepStart - 5) {
         return;
       }
 
       const isNoteOn = command === 9 && velocity > 0;
       if (waitForBarStart && isNoteOn && hand.left === "pending" && hand.right === "pending") {
-        effectiveStepStart = performance.now();
+        effectiveStepStart = eventTime;
         scheduleFinalize();
       }
 
@@ -1276,7 +1354,7 @@ const runSingleStep = ({
             velocity,
           });
           hand[keyboardMeta.hand] = keyboardMeta.verdict;
-          handOnsetDelta[keyboardMeta.hand] = performance.now() - effectiveStepStart;
+          handOnsetDelta[keyboardMeta.hand] = eventTime - effectiveStepStart;
           handVelocity[keyboardMeta.hand] = velocity;
           if (hand[keyboardMeta.hand] !== "correct") {
             stepFailed = true;
@@ -1292,7 +1370,7 @@ const runSingleStep = ({
               label: midiToLabel(note),
             });
             releaseState[keyboardMeta.hand] = true;
-            handReleaseDelta[keyboardMeta.hand] = performance.now() - effectiveStepStart;
+            handReleaseDelta[keyboardMeta.hand] = eventTime - effectiveStepStart;
           }
         }
       } else {
@@ -1324,7 +1402,7 @@ const runSingleStep = ({
             stepFailed = true;
           }
           if (noteHand) {
-            handOnsetDelta[noteHand] = performance.now() - effectiveStepStart;
+            handOnsetDelta[noteHand] = eventTime - effectiveStepStart;
             handVelocity[noteHand] = velocity;
             const delta = handOnsetDelta[noteHand];
           }
@@ -1340,7 +1418,7 @@ const runSingleStep = ({
               noteName,
             });
             releaseState[noteHand] = true;
-            handReleaseDelta[noteHand] = performance.now() - effectiveStepStart;
+            handReleaseDelta[noteHand] = eventTime - effectiveStepStart;
           }
         }
       }
@@ -1409,6 +1487,7 @@ const runUserAttempt = async (steps, notation, bpm) => {
         steps,
         bpm,
         stepStart,
+        expectedOnsetMs: stepOnsetMs,
         noteStates,
         noteHints,
         waitForBarStart: state.settings.practiceMode === "read" && index === 0,
@@ -1421,7 +1500,7 @@ const runUserAttempt = async (steps, notation, bpm) => {
       if (!result.ok) {
         metrics.mistakes += 1;
       }
-      stepOnsetMs = performance.now() + stepMs;
+      stepOnsetMs += stepMs;
     }
   } finally {
     stopPerformanceCapture();
@@ -1607,8 +1686,9 @@ const runLesson = async (lesson) => {
   while (!done && state.isPracticeActive) {
     const baseTempo = lesson.baseTempo || lesson.tempo || 60;
     const effectiveBpm = Math.max(20, baseTempo * state.dynamicTempoRatio);
+    const beatsPerBar = getLessonBeatsPerBar(lesson);
     updateTempoLabel(effectiveBpm, state.dynamicTempoRatio);
-    startTransport(effectiveBpm);
+    startTransport(effectiveBpm, beatsPerBar);
 
     if (state.settings.practiceMode === "imitation") {
       updatePracticeFeedback("Listen and watch first", "neutral");
@@ -1976,7 +2056,8 @@ const main = async () => {
     if (!state.transport.running) {
       const baseTempo = state.activeLesson?.baseTempo || state.activeLesson?.tempo || 60;
       const bpm = baseTempo * (state.dynamicTempoRatio || state.settings.tempoRatio || 1);
-      startTransport(bpm);
+      const beatsPerBar = getLessonBeatsPerBar(state.activeLesson);
+      startTransport(bpm, beatsPerBar);
     }
 
     state.refs.startMetronome.textContent = "Stop Metronome";

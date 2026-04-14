@@ -8,6 +8,7 @@ const lessonPacks = [
         id: "sr-1",
         title: "SR Test 1",
         baseTempo: 56,
+        timeSignature: "2/4",
         sourceType: "json-notes",
         steps: [
           { degree: 0, fingering: 1 },
@@ -20,6 +21,7 @@ const lessonPacks = [
         id: "sr-2",
         title: "SR Test 2",
         baseTempo: 60,
+        timeSignature: "2/4",
         sourceType: "json-notes",
         steps: [
           { degree: 1, fingering: 1 },
@@ -32,6 +34,7 @@ const lessonPacks = [
         id: "sr-3",
         title: "SR Test 3",
         baseTempo: 64,
+        timeSignature: "2/4",
         sourceType: "json-notes",
         steps: [
           { degree: 0, fingering: 1 },
