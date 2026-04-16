@@ -17,6 +17,22 @@ const virtualKeyboardInputId = "computer-keyboard";
 const srStorageKey = "sr-state";
 const settingsStorageKey = "settings";
 const activeKeyboardKeys = new Set();
+const rollPrerollBars = 1;
+const rollPostrollBars = 0;
+const rollStepsPerBeat = 2;
+
+function getRollWindowSteps() {
+  const signature = `${state.activeLesson?.timeSignature || `${state.transport?.beatsPerBar || 2}/4`}`;
+  const [numeratorRaw] = signature.split("/");
+  const beatsPerBar = Number.isFinite(Number(numeratorRaw)) && Number(numeratorRaw) > 0 ? Number(numeratorRaw) : 2;
+  const prerollSteps = rollPrerollBars * beatsPerBar * rollStepsPerBeat;
+  const postrollSteps = rollPostrollBars * beatsPerBar * rollStepsPerBeat;
+  return {
+    beatsPerBar,
+    prerollSteps,
+    postrollSteps,
+  };
+}
 
 const keyboardTestMap = {
   f: { hand: "left", verdict: "correct", midi: 53 },
@@ -56,6 +72,8 @@ const state = {
     nextBeatAudioTime: 0,
     beatIndex: 0,
     schedulerId: null,
+    metronomeEventId: null,
+    evalEventId: null,
   },
   audioContext: null,
   wakeLock: null,
@@ -63,6 +81,7 @@ const state = {
   activeMidiOutputId: null,
   midiTopologySignature: "",
   metronomeNoiseBuffer: null,
+  midiEventQueue: [],
   midiPollId: null,
   isPaused: false,
   lastPauseStartedAt: 0,
@@ -83,6 +102,12 @@ const state = {
   rollCursorTotalSteps: 0,
   rollCursorActive: false,
   rollCursorValue: 0,
+  lastRenderedPlayedCount: -1,
+  inputHistory: {
+    noteOnEvents: [],
+    activeNotes: new Map(),
+    nextEventId: 1,
+  },
   performanceCapture: {
     active: false,
     startMs: 0,
@@ -91,12 +116,78 @@ const state = {
     totalSteps: 0,
     notes: [],
     activeNotes: new Map(),
+    noteOnEvents: [],
+    nextEventId: 1,
   },
   settings: { ...defaultSettings },
   refs: {},
 };
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const tracePipeline = (stage, payload = {}) => {
+  console.log(`[TRACE:${stage}]`, payload);
+};
+
+const trackInputHistory = (message, perfTimeMs) => {
+  const status = message?.data?.[0] >> 4;
+  const note = message?.data?.[1];
+  const velocityRaw = message?.data?.[2] || 0;
+  if (status !== 8 && status !== 9) {
+    return;
+  }
+
+  const isNoteOn = status === 9 && velocityRaw > 0;
+  const keyboardHand = message?.keyboardMeta?.hand || null;
+
+  if (isNoteOn) {
+    state.inputHistory.noteOnEvents.push({
+      id: state.inputHistory.nextEventId++,
+      eventTimeMs: perfTimeMs,
+      note,
+      velocity: velocityRaw / 127,
+      keyboardMeta: message?.keyboardMeta || null,
+    });
+    if (state.inputHistory.noteOnEvents.length > 1200) {
+      state.inputHistory.noteOnEvents.splice(0, state.inputHistory.noteOnEvents.length - 1200);
+    }
+    state.inputHistory.activeNotes.set(note, {
+      startMs: perfTimeMs,
+      velocity: velocityRaw / 127,
+      handHint: keyboardHand,
+      keyboardMeta: message?.keyboardMeta || null,
+    });
+  } else {
+    state.inputHistory.activeNotes.delete(note);
+  }
+};
+
+const getTone = () => (typeof window !== "undefined" ? window.Tone : null);
+
+const getToneTransport = () => {
+  const tone = getTone();
+  return tone?.getTransport ? tone.getTransport() : null;
+};
+
+const getTransportSeconds = () => {
+  const transport = getToneTransport();
+  if (transport) {
+    return transport.seconds;
+  }
+  return performance.now() / 1000;
+};
+
+const ensureToneStarted = async () => {
+  const tone = getTone();
+  if (!tone?.start) {
+    return;
+  }
+  try {
+    await tone.start();
+  } catch (error) {
+    console.warn("Tone.start failed", error);
+  }
+};
 
 const normalizeMidiMessage = (message, forcedInputId = null) => {
   const rawData = message?.data;
@@ -109,6 +200,9 @@ const normalizeMidiMessage = (message, forcedInputId = null) => {
     keyboardMeta: message?.keyboardMeta || null,
     inputId: forcedInputId ?? message?.inputId ?? null,
     receivedTime: typeof message?.receivedTime === "number" ? message.receivedTime : null,
+    transportTimeSec:
+      typeof message?.transportTimeSec === "number" ? message.transportTimeSec : getTransportSeconds(),
+    perfTimeMs: typeof message?.perfTimeMs === "number" ? message.perfTimeMs : null,
   };
 };
 
@@ -125,8 +219,25 @@ function parseMidiMessage(message) {
     keyboardMeta: normalized.keyboardMeta,
     inputId: normalized.inputId,
     receivedTime: normalized.receivedTime,
+    transportTimeSec: normalized.transportTimeSec,
+    perfTimeMs: normalized.perfTimeMs,
   };
 }
+
+const dispatchMidiForEvaluation = (message) => {
+  capturePerformedInput(message);
+  if (currentMidiHandler) {
+    currentMidiHandler(message);
+  }
+};
+
+const processQueuedMidiEvents = () => {
+  if (!state.midiEventQueue.length || state.isPaused) {
+    return;
+  }
+  const queue = state.midiEventQueue.splice(0, state.midiEventQueue.length);
+  queue.forEach((message) => dispatchMidiForEvaluation(message));
+};
 
 const keyboardEventToMidiMessage = (command, note, velocity, keyboardMeta = null) => ({
   data: [(command << 4), note, velocity],
@@ -207,6 +318,9 @@ const ensureWakeLockListener = () => {
 
 const setMidiHandler = (handler) => {
   currentMidiHandler = handler;
+  if (!handler) {
+    state.midiEventQueue = [];
+  }
 };
 
 const isFromActiveInput = (message) => {
@@ -298,10 +412,23 @@ const handleMidiMessage = (message) => {
     return;
   }
 
-  capturePerformedInput(normalized);
+  const enriched = {
+    ...normalized,
+    perfTimeMs: getSafeEventTimeMs(normalized.receivedTime),
+    transportTimeSec: typeof normalized.transportTimeSec === "number" ? normalized.transportTimeSec : getTransportSeconds(),
+  };
 
-  if (currentMidiHandler) {
-    currentMidiHandler(normalized);
+  trackInputHistory(enriched, enriched.perfTimeMs);
+
+  const shouldQueueForTransport =
+    state.transport.running &&
+    !!getToneTransport() &&
+    normalized.inputId !== null;
+
+  if (shouldQueueForTransport) {
+    state.midiEventQueue.push(enriched);
+  } else {
+    dispatchMidiForEvaluation(enriched);
   }
 };
 
@@ -501,6 +628,10 @@ const setupComputerKeyboardInput = () => {
 };
 
 const getAudioContext = () => {
+  const tone = getTone();
+  if (tone?.getContext?.().rawContext) {
+    return tone.getContext().rawContext;
+  }
   if (!state.audioContext) {
     state.audioContext = new (window.AudioContext || window.webkitAudioContext)();
   }
@@ -569,6 +700,28 @@ const midiToLabel = (midiNumber) => {
 };
 
 const startPerformanceCapture = (stepMs, totalSteps, originMs = performance.now()) => {
+  const historyWindowMs = Math.max(700, Number(state.settings?.timingWindow || 120) * 6);
+  const seededNoteOnEvents = (state.inputHistory?.noteOnEvents || [])
+    .filter((entry) => entry.eventTimeMs >= originMs - historyWindowMs && entry.eventTimeMs <= originMs)
+    .map((entry) => ({
+      id: entry.id,
+      eventTimeMs: entry.eventTimeMs,
+      note: entry.note,
+      velocity: entry.velocity,
+      keyboardMeta: entry.keyboardMeta || null,
+      consumed: false,
+    }));
+
+  const seededActiveNotes = new Map();
+  if (state.inputHistory?.activeNotes) {
+    state.inputHistory.activeNotes.forEach((active, note) => {
+      seededActiveNotes.set(note, {
+        startMs: active.startMs - originMs,
+        handHint: active.handHint || active.keyboardMeta?.hand || null,
+      });
+    });
+  }
+
   state.performanceCapture = {
     active: true,
     startMs: originMs,
@@ -576,8 +729,17 @@ const startPerformanceCapture = (stepMs, totalSteps, originMs = performance.now(
     stepMs,
     totalSteps,
     notes: [],
-    activeNotes: new Map(),
+    activeNotes: seededActiveNotes,
+    noteOnEvents: seededNoteOnEvents,
+    nextEventId: 1,
   };
+
+  tracePipeline("capture-seed", {
+    originMs: Math.round(originMs),
+    seededOnEvents: seededNoteOnEvents.length,
+    seededActiveNotes: seededActiveNotes.size,
+    historyWindowMs,
+  });
 };
 
 const getSafeEventTimeMs = (receivedTime) => {
@@ -737,13 +899,82 @@ const buildPlayedLayerNotation = (scaleName, totalSteps) => {
 const buildPlayedRollSequence = (totalSteps) => {
   const capture = state.performanceCapture;
   const stepMs = capture.stepMs || 1;
+  const { prerollSteps, postrollSteps } = getRollWindowSteps();
+  const attemptStartMs = -prerollSteps * stepMs;
+  const attemptDurationMs = Math.max(stepMs, (totalSteps + postrollSteps) * stepMs);
   return getCapturedNotesSnapshot()
     .map((note) => {
-      const t = Math.max(0, note.startMs / stepMs);
-      const g = Math.max(0.1, (note.endMs - note.startMs) / stepMs);
+      const clippedStartMs = Math.max(attemptStartMs, note.startMs);
+      const clippedEndMs = Math.min(attemptDurationMs, note.endMs);
+      if (clippedEndMs <= clippedStartMs) {
+        return null;
+      }
+
+      const t = (clippedStartMs - attemptStartMs) / stepMs;
+      const g = Math.max(0.1, (clippedEndMs - clippedStartMs) / stepMs);
       return { t, g, n: note.midi };
     })
-    .filter((event) => event.t <= totalSteps + 0.5);
+    .filter(Boolean)
+    .filter((event) => event.t <= totalSteps + prerollSteps + postrollSteps + 0.5);
+};
+
+const analyzeAttemptCapture = (steps, notation, stepMs) => {
+  const notes = [...(state.performanceCapture?.notes || [])].sort((a, b) => a.startMs - b.startMs);
+  if (!notes.length || !steps.length) {
+    return {
+      globalLagDetected: false,
+      lagSteps: 0,
+      lagMs: 0,
+      bestAlignmentScore: 0,
+      zeroAlignmentScore: 0,
+    };
+  }
+
+  const expectedSlots = steps.map((_, index) => [notation.expected[index]?.leftMidi, notation.expected[index]?.rightMidi]);
+  const playedSlots = new Map();
+
+  notes.forEach((note) => {
+    const slot = Math.round(note.startMs / stepMs);
+    if (slot < -2 || slot > steps.length + 2) {
+      return;
+    }
+    if (!playedSlots.has(slot)) {
+      playedSlots.set(slot, new Set());
+    }
+    playedSlots.get(slot).add(note.midi);
+  });
+
+  const scoreForOffset = (offset) => {
+    let hits = 0;
+    expectedSlots.forEach((expectedPair, index) => {
+      const played = playedSlots.get(index + offset);
+      if (!played) {
+        return;
+      }
+      expectedPair.forEach((midi) => {
+        if (midi != null && played.has(midi)) {
+          hits += 1;
+        }
+      });
+    });
+    return hits / Math.max(1, expectedSlots.length * 2);
+  };
+
+  const offsets = [-2, -1, 0, 1, 2];
+  const scored = offsets.map((offset) => ({ offset, score: scoreForOffset(offset) }));
+  scored.sort((a, b) => b.score - a.score);
+
+  const best = scored[0];
+  const zero = scored.find((entry) => entry.offset === 0) || { offset: 0, score: 0 };
+  const globalLagDetected = best.offset !== 0 && best.score >= 0.7 && best.score - zero.score >= 0.18;
+
+  return {
+    globalLagDetected,
+    lagSteps: best.offset,
+    lagMs: Math.round(best.offset * stepMs),
+    bestAlignmentScore: best.score,
+    zeroAlignmentScore: zero.score,
+  };
 };
 
 const capturePerformedInput = (message) => {
@@ -764,17 +995,41 @@ const capturePerformedInput = (message) => {
   const nowRelative = eventTimeMs - capture.startMs;
   const keyboardHand = message?.keyboardMeta?.hand || null;
 
-  if (nowRelative < -8) {
-    return;
-  }
-
   if (isNoteOn) {
-    if (!capture.activeNotes.has(note)) {
-      capture.activeNotes.set(note, {
-        startMs: nowRelative,
-        handHint: keyboardHand,
+    capture.noteOnEvents.push({
+      id: capture.nextEventId++,
+      eventTimeMs,
+      note,
+      velocity: velocityRaw / 127,
+      keyboardMeta: message?.keyboardMeta || null,
+      consumed: false,
+    });
+    if (capture.noteOnEvents.length > 800) {
+      capture.noteOnEvents.splice(0, capture.noteOnEvents.length - 800);
+    }
+
+    tracePipeline("capture-note-on", {
+      note,
+      velocity: velocityRaw / 127,
+      nowRelative: Math.round(nowRelative),
+      keyboardHand,
+      captureStartMs: Math.round(capture.startMs),
+      totalOnEvents: capture.noteOnEvents.length,
+    });
+
+    const active = capture.activeNotes.get(note);
+    if (active) {
+      capture.notes.push({
+        midi: note,
+        startMs: active.startMs,
+        endMs: Math.max(active.startMs + 10, nowRelative - 1),
+        handHint: active.handHint || keyboardHand,
       });
     }
+    capture.activeNotes.set(note, {
+      startMs: nowRelative,
+      handHint: keyboardHand,
+    });
   } else {
     const active = capture.activeNotes.get(note);
     if (active) {
@@ -786,6 +1041,12 @@ const capturePerformedInput = (message) => {
       });
       capture.activeNotes.delete(note);
     }
+    tracePipeline("capture-note-off", {
+      note,
+      nowRelative: Math.round(nowRelative),
+      keyboardHand,
+      activeNotes: capture.activeNotes.size,
+    });
   }
 
   const totalSteps = capture.totalSteps || 1;
@@ -854,6 +1115,12 @@ const playPerformedNote = (midiNumber, velocity = 0.7) => {
   }
   const ctx = getAudioContext();
   const now = ctx.currentTime + 0.002;
+  tracePipeline("sound-played", {
+    midi: midiNumber,
+    velocity,
+    inputId: currentMidiInputId,
+    atAudioTimeSec: Number(now.toFixed(4)),
+  });
   schedulePianoNote(ctx, midiNumber, now, 0.18, Math.max(0.2, velocity));
 };
 
@@ -867,18 +1134,85 @@ const pulseTempoDot = () => {
 };
 
 const stopTransport = () => {
+  const toneTransport = getToneTransport();
+  if (toneTransport) {
+    if (state.transport.metronomeEventId != null) {
+      toneTransport.clear(state.transport.metronomeEventId);
+    }
+    if (state.transport.evalEventId != null) {
+      toneTransport.clear(state.transport.evalEventId);
+    }
+    toneTransport.stop();
+  }
   if (state.transport.schedulerId) {
     clearInterval(state.transport.schedulerId);
   }
   state.transport.running = false;
   state.transport.schedulerId = null;
+  state.transport.metronomeEventId = null;
+  state.transport.evalEventId = null;
+  state.midiEventQueue = [];
 };
 
 const startTransport = (bpm, beatsPerBar = 2, options = {}) => {
+  ensureToneStarted();
   const ctx = getAudioContext();
   const normalizedBpm = Number(bpm) || 60;
   const normalizedBeatsPerBar = Math.max(1, Number(beatsPerBar) || 2);
   const forceDownbeat = !!options.forceDownbeat;
+  const toneTransport = getToneTransport();
+
+  if (toneTransport) {
+    toneTransport.timeSignature = normalizedBeatsPerBar;
+    toneTransport.bpm.value = normalizedBpm;
+
+    if (
+      state.transport.running &&
+      !forceDownbeat &&
+      Math.abs(state.transport.bpm - normalizedBpm) < 0.01 &&
+      state.transport.beatsPerBar === normalizedBeatsPerBar
+    ) {
+      return;
+    }
+
+    stopTransport();
+
+    state.transport.running = true;
+    state.transport.bpm = normalizedBpm;
+    state.transport.beatsPerBar = normalizedBeatsPerBar;
+    state.transport.beatDurationSec = 60 / normalizedBpm;
+    state.transport.beatIndex = 0;
+
+    if (forceDownbeat) {
+      toneTransport.position = 0;
+    }
+
+    state.transport.metronomeEventId = toneTransport.scheduleRepeat((time) => {
+      const beatIndex = state.transport.beatIndex;
+      if (state.metronomeEnabled) {
+        scheduleClick(ctx, time, beatIndex % state.transport.beatsPerBar === 0);
+      }
+      const tone = getTone();
+      if (tone?.Draw) {
+        tone.Draw.schedule(() => {
+          if (state.transport.running) {
+            pulseTempoDot();
+          }
+        }, time);
+      } else {
+        pulseTempoDot();
+      }
+      state.transport.beatIndex += 1;
+    }, "4n");
+
+    state.transport.evalEventId = toneTransport.scheduleRepeat(() => {
+      processQueuedMidiEvents();
+    }, 0.01);
+
+    toneTransport.start(forceDownbeat ? "+0.12" : "+0.04");
+    state.transport.startPerfMs = performance.now();
+    return;
+  }
 
   if (
     state.transport.running &&
@@ -916,6 +1250,8 @@ const startTransport = (bpm, beatsPerBar = 2, options = {}) => {
         scheduleClick(ctx, beatAudioTime, beatIndex % state.transport.beatsPerBar === 0);
       }
 
+      processQueuedMidiEvents();
+
       const visualDelay = Math.max(0, beatPerfMs - performance.now());
       setTimeout(() => {
         if (state.transport.running) {
@@ -930,11 +1266,23 @@ const startTransport = (bpm, beatsPerBar = 2, options = {}) => {
 };
 
 const alignToGridMs = (stepMs, futureOnly = false) => {
-  const now = performance.now();
+  const nowPerf = performance.now();
   if (!state.transport.running || !stepMs) {
-    return now;
+    return nowPerf;
   }
-  const elapsed = now - state.transport.startPerfMs;
+
+  const toneTransport = getToneTransport();
+  if (toneTransport) {
+    const stepSec = stepMs / 1000;
+    const nowSec = toneTransport.seconds;
+    const stepsFromStart = futureOnly
+      ? Math.floor(nowSec / stepSec) + 1
+      : Math.round(nowSec / stepSec);
+    const targetSec = Math.max(0, stepsFromStart) * stepSec;
+    return nowPerf + (targetSec - nowSec) * 1000;
+  }
+
+  const elapsed = nowPerf - state.transport.startPerfMs;
   const stepsFromStart = futureOnly
     ? Math.floor(elapsed / stepMs) + 1
     : Math.round(elapsed / stepMs);
@@ -1067,13 +1415,14 @@ const renderPianoRoll = (steps, currentIndex = -1) => {
   }
   const expectedRoll = state.refs.pianoRollExpected;
   const playedRoll = state.refs.pianoRollPlayed;
-  const total = Math.max(steps.length, 1);
+  const { prerollSteps, postrollSteps } = getRollWindowSteps();
+  const total = Math.max(steps.length + prerollSteps + postrollSteps, 1);
 
   if (currentIndex < 0) {
     expectedRoll.sequence = [];
     steps.forEach((step, index) => {
-      expectedRoll.sequence.push({ t: index, g: 1, n: step.rightMidi || 60 });
-      expectedRoll.sequence.push({ t: index, g: 1, n: step.leftMidi || 48 });
+      expectedRoll.sequence.push({ t: index + prerollSteps, g: 1, n: step.rightMidi || 60 });
+      expectedRoll.sequence.push({ t: index + prerollSteps, g: 1, n: step.leftMidi || 48 });
     });
     expectedRoll.setAttribute("timebase", String(total));
     expectedRoll.setAttribute("xrange", String(Math.max(16, total + 4)));
@@ -1092,16 +1441,29 @@ const renderPianoRoll = (steps, currentIndex = -1) => {
     playedRoll.redraw();
   }
 
+  if (state.lastRenderedPlayedCount !== playedRoll.sequence.length) {
+    state.lastRenderedPlayedCount = playedRoll.sequence.length;
+    const last = playedRoll.sequence[playedRoll.sequence.length - 1] || null;
+    tracePipeline("roll-render", {
+      cursor: Number((currentIndex || 0).toFixed ? currentIndex.toFixed(3) : currentIndex),
+      playedCount: playedRoll.sequence.length,
+      lastPlayed: last,
+    });
+  }
+
+  const normalizedIndex = currentIndex < 0 ? 0 : currentIndex;
+  const displayedCursor = Math.max(prerollSteps, Math.min(prerollSteps + steps.length, normalizedIndex + prerollSteps));
+
   if (typeof expectedRoll.locate === "function") {
-    expectedRoll.locate(Math.max(0, currentIndex));
+    expectedRoll.locate(Math.max(0, displayedCursor));
   } else {
-    expectedRoll.setAttribute("cursor", String(Math.max(0, currentIndex)));
+    expectedRoll.setAttribute("cursor", String(Math.max(0, displayedCursor)));
   }
 
   if (typeof playedRoll.locate === "function") {
-    playedRoll.locate(Math.max(0, currentIndex));
+    playedRoll.locate(Math.max(0, displayedCursor));
   } else {
-    playedRoll.setAttribute("cursor", String(Math.max(0, currentIndex)));
+    playedRoll.setAttribute("cursor", String(Math.max(0, displayedCursor)));
   }
 };
 
@@ -1127,13 +1489,15 @@ const playDemo = async (steps, notation, bpm) => {
   let onsetMs = alignToGridMs(stepMs, true);
   let lastReleaseMs = onsetMs;
 
+  startContinuousRollCursor(onsetMs, stepMs, steps.length);
+
   for (let index = 0; index < steps.length; index++) {
     const waitMs = onsetMs - performance.now();
     if (waitMs > 0) {
       await wait(waitMs);
     }
 
-    renderPianoRoll(state.expectedRollSteps, index);
+    renderPianoRoll(state.expectedRollSteps, state.rollCursorActive ? state.rollCursorValue : index);
     const playedNotation = buildPlayedLayerNotation(notation.scaleName, steps.length);
     renderStaffLayers(notation, steps, index, "pending", [], [], playedNotation);
     markPianoKeys(steps[index], "#3c6df0");
@@ -1149,6 +1513,9 @@ const playDemo = async (steps, notation, bpm) => {
   if (tailWaitMs > 0) {
     await wait(tailWaitMs);
   }
+
+  stopContinuousRollCursor();
+  renderPianoRoll(state.expectedRollSteps, steps.length);
 };
 
 const describeTiming = (deltaMs, timingWindow) => {
@@ -1207,6 +1574,7 @@ const runSingleStep = ({
   const releaseWindow = Number(state.settings.releaseWindow);
   const stepMs = 60000 / bpm / 2;
   const releaseState = { left: false, right: false };
+  const earlyCaptureWindowMs = Math.max(12, timingWindow * 1.6);
 
   return new Promise((resolve) => {
     const hand = { left: "pending", right: "pending" };
@@ -1221,17 +1589,61 @@ const runSingleStep = ({
     const receivedEvents = [];
     const onsetTargetMs = state.settings.practiceMode === "imitation" && stepIndex === 0 ? stepMs : 0;
 
-    console.log(`[Step ${stepIndex + 1}] EXPECTED`, {
-      right: { name: expected.right, midi: expected.rightMidi, label: midiToLabel(expected.rightMidi) },
-      left: { name: expected.left, midi: expected.leftMidi, label: midiToLabel(expected.leftMidi) },
-      bpm,
-      stepMs,
-      onsetTargetMs,
-      timingWindow,
-      releaseWindow,
-      mode: state.settings.practiceMode,
-      input: currentMidiInputId,
-    });
+    const registerNoteOn = ({ note, velocity, keyboardMeta, eventTime, source = "live" }) => {
+      if (currentMidiInputId === virtualKeyboardInputId && keyboardMeta) {
+        receivedEvents.push({
+          atMs: Math.round(eventTime),
+          type: source === "buffered" ? "on-buffer" : "on",
+          hand: keyboardMeta.hand,
+          verdict: keyboardMeta.verdict,
+          note,
+          label: midiToLabel(note),
+          velocity,
+        });
+        hand[keyboardMeta.hand] = keyboardMeta.verdict;
+        handOnsetDelta[keyboardMeta.hand] = eventTime - effectiveStepStart;
+        handVelocity[keyboardMeta.hand] = velocity;
+        if (hand[keyboardMeta.hand] !== "correct") {
+          stepFailed = true;
+        }
+        return true;
+      }
+
+      const noteName = midiToNote(note, notation.scaleName);
+      receivedEvents.push({
+        atMs: Math.round(eventTime),
+        type: source === "buffered" ? "on-buffer" : "on",
+        note,
+        label: midiToLabel(note),
+        noteName,
+        velocity,
+      });
+
+      const matchedRight = note === expected.rightMidi;
+      const matchedLeft = note === expected.leftMidi;
+      let noteHand = null;
+
+      if (matchedRight) {
+        hand.right = "correct";
+        noteHand = "right";
+      } else if (matchedLeft) {
+        hand.left = "correct";
+        noteHand = "left";
+      } else {
+        const proximityRight = Math.abs(note - expected.rightMidi);
+        const proximityLeft = Math.abs(note - expected.leftMidi);
+        noteHand = proximityLeft <= proximityRight ? "left" : "right";
+        hand[noteHand] = "wrong";
+        stepFailed = true;
+      }
+
+      if (noteHand) {
+        handOnsetDelta[noteHand] = eventTime - effectiveStepStart;
+        handVelocity[noteHand] = velocity;
+      }
+      updatePracticeFeedback(`Played ${noteName}`, matchedLeft || matchedRight ? "good" : "bad");
+      return true;
+    };
 
     if (currentMidiInputId === virtualKeyboardInputId) {
       const latchWindowMs = 140;
@@ -1272,7 +1684,7 @@ const runSingleStep = ({
           const velocityText = describeVelocity(handVelocity[handName]);
           const releaseDelta = handReleaseDelta[handName];
           const releaseText =
-            releaseDelta == null || releaseDelta > stepMs + releaseWindow
+            releaseDelta != null && releaseDelta > stepMs + releaseWindow
               ? "⟂ release"
               : "";
 
@@ -1295,7 +1707,7 @@ const runSingleStep = ({
 
           const badTiming = adjustedOnsetDelta != null && Math.abs(adjustedOnsetDelta) > timingWindow;
           const badVelocity = handVelocity[handName] != null && handVelocity[handName] < 0.35;
-          const badRelease = releaseDelta == null || releaseDelta > stepMs + releaseWindow;
+          const badRelease = releaseDelta != null && releaseDelta > stepMs + releaseWindow;
           const isCorrect = !isMissed && !isWrong;
           const ok = isCorrect && !badTiming && !badVelocity && !badRelease;
 
@@ -1329,29 +1741,6 @@ const runSingleStep = ({
         updatePracticeFeedback(`Step ${stepIndex + 1}: ${feedbackParts.join(" | ")}`, handResult.ok ? "good" : "bad");
       }
 
-      console.log(`[Step ${stepIndex + 1}] RESULT`, {
-        receivedEvents,
-        handState: hand,
-        handOnsetDelta,
-        adjustedHandOnsetDelta: {
-          left: handOnsetDelta.left == null ? null : handOnsetDelta.left - onsetTargetMs,
-          right: handOnsetDelta.right == null ? null : handOnsetDelta.right - onsetTargetMs,
-        },
-        onsetTargetMs,
-        handVelocity,
-        handReleaseDelta,
-        gradedStates: handResult.states,
-        gradedHints: handResult.hints,
-        scores: {
-          noteHits: handResult.noteHits,
-          onsetHit: handResult.onsetHit,
-          pressureHit: handResult.pressureHit,
-          releaseHit: handResult.releaseHit,
-          noteOnlyOk,
-          ok: handResult.ok,
-        },
-      });
-
       const pianoColor = handResult.ok ? "#22c55e" : "#ef4444";
       markPianoKeys(step, pianoColor);
 
@@ -1374,6 +1763,8 @@ const runSingleStep = ({
         onsetHit: handResult.onsetHit,
         pressureHit: handResult.pressureHit,
         releaseHit: handResult.releaseHit,
+        onsetDeltaLeft: handOnsetDelta.left,
+        onsetDeltaRight: handOnsetDelta.right,
       });
     };
 
@@ -1389,18 +1780,42 @@ const runSingleStep = ({
       scheduleFinalize();
     }
 
+    if (!waitForBarStart && Array.isArray(state.performanceCapture?.noteOnEvents)) {
+      const buffered = state.performanceCapture.noteOnEvents
+        .filter(
+          (entry) =>
+            !entry.consumed &&
+            entry.eventTimeMs >= effectiveStepStart - earlyCaptureWindowMs &&
+            entry.eventTimeMs <= effectiveStepStart + Math.max(40, stepMs * 0.25)
+        )
+        .sort((a, b) => a.eventTimeMs - b.eventTimeMs);
+
+      buffered.forEach((entry) => {
+        const accepted = registerNoteOn({
+          note: entry.note,
+          velocity: entry.velocity,
+          keyboardMeta: entry.keyboardMeta,
+          eventTime: entry.eventTimeMs,
+          source: "buffered",
+        });
+        if (accepted) {
+          entry.consumed = true;
+        }
+      });
+    }
+
     setMidiHandler((rawMessage) => {
       const parsed = parseMidiMessage(rawMessage);
       if (!parsed) {
         return;
       }
-      const { command, note, velocity, keyboardMeta, receivedTime } = parsed;
+      const { command, note, velocity, keyboardMeta, receivedTime, perfTimeMs } = parsed;
       if (command !== 8 && command !== 9) {
         return;
       }
 
-      const eventTime = getSafeEventTimeMs(receivedTime);
-      if (eventTime < effectiveStepStart - 5) {
+      const eventTime = typeof perfTimeMs === "number" ? perfTimeMs : getSafeEventTimeMs(receivedTime);
+      if (eventTime < effectiveStepStart - earlyCaptureWindowMs) {
         return;
       }
 
@@ -1416,21 +1831,7 @@ const runSingleStep = ({
 
       if (currentMidiInputId === virtualKeyboardInputId && keyboardMeta) {
         if (isNoteOn) {
-          receivedEvents.push({
-            atMs: Math.round(performance.now()),
-            type: "on",
-            hand: keyboardMeta.hand,
-            verdict: keyboardMeta.verdict,
-            note,
-            label: midiToLabel(note),
-            velocity,
-          });
-          hand[keyboardMeta.hand] = keyboardMeta.verdict;
-          handOnsetDelta[keyboardMeta.hand] = eventTime - effectiveStepStart;
-          handVelocity[keyboardMeta.hand] = velocity;
-          if (hand[keyboardMeta.hand] !== "correct") {
-            stepFailed = true;
-          }
+          registerNoteOn({ note, velocity, keyboardMeta, eventTime, source: "live" });
           updatePracticeFeedback(`${keyboardMeta.hand} hand: ${keyboardMeta.verdict}`, keyboardMeta.verdict === "correct" ? "good" : "bad");
         } else {
           if (handOnsetDelta[keyboardMeta.hand] != null) {
@@ -1446,40 +1847,10 @@ const runSingleStep = ({
           }
         }
       } else {
-        const noteName = midiToNote(note, notation.scaleName);
         if (isNoteOn) {
-          receivedEvents.push({
-            atMs: Math.round(performance.now()),
-            type: "on",
-            note,
-            label: midiToLabel(note),
-            noteName,
-            velocity,
-          });
-          const matchedRight = note === expected.rightMidi;
-          const matchedLeft = note === expected.leftMidi;
-
-          let noteHand = null;
-          if (matchedRight) {
-            hand.right = "correct";
-            noteHand = "right";
-          } else if (matchedLeft) {
-            hand.left = "correct";
-            noteHand = "left";
-          } else {
-            const proximityRight = Math.abs(note - expected.rightMidi);
-            const proximityLeft = Math.abs(note - expected.leftMidi);
-            noteHand = proximityLeft <= proximityRight ? "left" : "right";
-            hand[noteHand] = "wrong";
-            stepFailed = true;
-          }
-          if (noteHand) {
-            handOnsetDelta[noteHand] = eventTime - effectiveStepStart;
-            handVelocity[noteHand] = velocity;
-            const delta = handOnsetDelta[noteHand];
-          }
-          updatePracticeFeedback(`Played ${noteName}`, matchedLeft || matchedRight ? "good" : "bad");
+          registerNoteOn({ note, velocity, keyboardMeta: null, eventTime, source: "live" });
         } else {
+          const noteName = midiToNote(note, notation.scaleName);
           const noteHand = Math.abs(note - expected.leftMidi) <= Math.abs(note - expected.rightMidi) ? "left" : "right";
           if (handOnsetDelta[noteHand] != null) {
             receivedEvents.push({
@@ -1525,6 +1896,7 @@ const runUserAttempt = async (steps, notation, bpm) => {
     releaseHits: 0,
     stepCount: steps.length,
     mistakes: 0,
+    onsetDeltas: [],
   };
 
   const stepMs = 60000 / bpm / 2;
@@ -1549,7 +1921,7 @@ const runUserAttempt = async (steps, notation, bpm) => {
         await wait(waitMs);
       }
 
-      renderPianoRoll(state.expectedRollSteps, state.rollCursorValue || index);
+      renderPianoRoll(state.expectedRollSteps, state.rollCursorActive ? state.rollCursorValue : index);
       const playedNotation = buildPlayedLayerNotation(notation.scaleName, steps.length);
       renderStaffLayers(notation, steps, index, "pending", noteStates, noteHints, playedNotation);
       updateScoreAutoScroll(index, steps.length);
@@ -1576,6 +1948,12 @@ const runUserAttempt = async (steps, notation, bpm) => {
       metrics.onsetHits += result.onsetHit;
       metrics.pressureHits += result.pressureHit;
       metrics.releaseHits += result.releaseHit;
+      if (Number.isFinite(result.onsetDeltaLeft)) {
+        metrics.onsetDeltas.push(result.onsetDeltaLeft);
+      }
+      if (Number.isFinite(result.onsetDeltaRight)) {
+        metrics.onsetDeltas.push(result.onsetDeltaRight);
+      }
       if (!result.ok) {
         metrics.mistakes += 1;
       }
@@ -1600,6 +1978,11 @@ const runUserAttempt = async (steps, notation, bpm) => {
 
   const timingPass = onsetAccuracy >= 60 && pressureAccuracy >= 40 && releaseAccuracy >= 40;
   const passed = currentMidiInputId === virtualKeyboardInputId ? notePass : notePass && timingPass;
+  const captureAnalysis = analyzeAttemptCapture(steps, notation, stepMs);
+
+  const meanOnsetDelta = metrics.onsetDeltas.length
+    ? metrics.onsetDeltas.reduce((sum, value) => sum + value, 0) / metrics.onsetDeltas.length
+    : 0;
 
   return {
     passed,
@@ -1609,6 +1992,12 @@ const runUserAttempt = async (steps, notation, bpm) => {
     releaseAccuracy,
     mistakes: metrics.mistakes,
     noteHints,
+    meanOnsetDelta,
+    globalLagDetected: captureAnalysis.globalLagDetected,
+    lagSteps: captureAnalysis.lagSteps,
+    lagMs: captureAnalysis.lagMs,
+    bestAlignmentScore: captureAnalysis.bestAlignmentScore,
+    zeroAlignmentScore: captureAnalysis.zeroAlignmentScore,
   };
 };
 
@@ -1762,6 +2151,7 @@ const runLesson = async (lesson) => {
   let lastSummary = null;
   const targetTempoRatio = state.settings.tempoRatio;
   const tempoRecoveryStep = 0.2;
+  let repeatWithoutTempoDropCount = 0;
 
   while (!done && state.isPracticeActive) {
     const baseTempo = lesson.baseTempo || lesson.tempo || 60;
@@ -1773,7 +2163,7 @@ const runLesson = async (lesson) => {
     if (state.settings.practiceMode === "imitation") {
       updatePracticeFeedback("Listen and watch first", "neutral");
       await playDemo(steps, notation, effectiveBpm);
-      await wait(140);
+      renderPianoRoll(state.expectedRollSteps, 0);
     }
 
     updatePracticeFeedback("Your turn", "neutral");
@@ -1781,6 +2171,7 @@ const runLesson = async (lesson) => {
     lastSummary = summary;
 
     if (summary.passed) {
+      repeatWithoutTempoDropCount = 0;
       if (state.dynamicTempoRatio < targetTempoRatio - 0.001) {
         const nextRatio = Math.min(targetTempoRatio, state.dynamicTempoRatio + tempoRecoveryStep);
         updatePracticeFeedback(
@@ -1811,13 +2202,28 @@ const runLesson = async (lesson) => {
       }
       const hintPreview = (summary.noteHints || []).filter(Boolean).slice(0, 2).join(" | ");
       const reasonText = reasons.length ? reasons.join(", ") : "step hints";
-      updatePracticeFeedback(`Will repeat next bar. Issue: ${reasonText}${hintPreview ? ` (${hintPreview})` : ""}`, "bad");
-      if (summary.mistakes >= 1) {
-        const previousRatio = state.dynamicTempoRatio;
-        state.dynamicTempoRatio = Math.max(0.25, state.dynamicTempoRatio * 0.85);
-        if (Math.abs(previousRatio - state.dynamicTempoRatio) > 0.0001) {
-          const nextBpm = Math.max(20, baseTempo * state.dynamicTempoRatio);
-          startTransport(nextBpm, beatsPerBar, { forceDownbeat: true });
+      const nearTargetAccuracy = summary.accuracy >= Math.max(0, state.settings.accuracyTarget - 12);
+      const preferRepeatOnly = summary.globalLagDetected || nearTargetAccuracy;
+
+      if (preferRepeatOnly && repeatWithoutTempoDropCount < 2) {
+        repeatWithoutTempoDropCount += 1;
+        const lagHint = summary.globalLagDetected
+          ? ` Overall lag ~${summary.lagMs}ms (${summary.lagSteps > 0 ? "late" : "early"}).`
+          : "";
+        updatePracticeFeedback(
+          `Will repeat same tempo.${lagHint} Focus on first beat.${hintPreview ? ` (${hintPreview})` : ""}`,
+          "bad"
+        );
+      } else {
+        repeatWithoutTempoDropCount = 0;
+        updatePracticeFeedback(`Will repeat next bar slower. Issue: ${reasonText}${hintPreview ? ` (${hintPreview})` : ""}`, "bad");
+        if (summary.mistakes >= 1) {
+          const previousRatio = state.dynamicTempoRatio;
+          state.dynamicTempoRatio = Math.max(0.25, state.dynamicTempoRatio * 0.85);
+          if (Math.abs(previousRatio - state.dynamicTempoRatio) > 0.0001) {
+            const nextBpm = Math.max(20, baseTempo * state.dynamicTempoRatio);
+            startTransport(nextBpm, beatsPerBar, { forceDownbeat: true });
+          }
         }
       }
       await wait(200);
